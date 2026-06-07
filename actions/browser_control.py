@@ -444,8 +444,10 @@ class _BrowserSession:
                 Path(jarvis).mkdir(parents=True, exist_ok=True)
                 self._context = await engine_obj.launch_persistent_context(jarvis, **kwargs)
 
-            await asyncio.sleep(0.5)  
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.3)
+            # Use existing page if Playwright opened one, else create
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
             print(f"[Browser] ✅ Firefox launched")
             return
 
@@ -459,8 +461,9 @@ class _BrowserSession:
                 "no_viewport": True,
             }
             self._context = await engine_obj.launch_persistent_context(safari_profile, **kwargs)
-            await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.3)
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
             print(f"[Browser] ✅ Safari launched")
             return
 
@@ -477,6 +480,7 @@ class _BrowserSession:
                 "--no-first-run",
                 "--disable-default-apps",
                 "--no-default-browser-check",
+                "--profile-directory=Default",
             ],
         }
 
@@ -493,8 +497,9 @@ class _BrowserSession:
 
         try:
             self._context = await engine_obj.launch_persistent_context(profile, **kwargs)
-            await asyncio.sleep(0.5) 
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.3)
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
             print(f"[Browser] ✅ Launched [{label}] profile={profile}")
             return
         except Exception as e:
@@ -506,19 +511,33 @@ class _BrowserSession:
 
         try:
             self._context = await engine_obj.launch_persistent_context(jarvis_profile, **kwargs)
-            await asyncio.sleep(0.5)
-            self._page = await self._context.new_page()
+            await asyncio.sleep(0.3)
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
             print(f"[Browser] ✅ Launched [{label}] with JARVIS profile")
         except Exception as e2:
             raise RuntimeError(f"Could not launch {self.browser_name}: {e2}") from e2
 
 
     async def _get_page(self) -> Page:
-        await self._launch()
-        # If somehow page got closed, open a fresh one
-        if self._page is None or self._page.is_closed():
-            self._page = await self._context.new_page()
+        if self._context is None:
+            await self._launch()
+
+        try:
+            # If no page set, try to grab from context, else create
+            if self._page is None or self._page.is_closed():
+                pages = self._context.pages
+                self._page = pages[0] if pages else await self._context.new_page()
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            # Context or browser is dead, restart it entirely
+            print(f"[Browser] Context dead ({e}). Relaunching...")
+            self._context = None
+            await self._launch()
+            pages = self._context.pages
+            self._page = pages[0] if pages else await self._context.new_page()
             await asyncio.sleep(0.2)
+
         return self._page
 
     async def go_to(self, url: str) -> str:
@@ -540,18 +559,9 @@ class _BrowserSession:
 
         result_url = await _do_goto(page)
 
-        if result_url in ("about:blank", "", None, prev_url) and prev_url in ("about:blank", "", None):
-            print(f"[Browser] Still blank after goto — retrying on new tab: {url}")
-            try:
-                new_page   = await self._context.new_page()
-                self._page = new_page
-                result_url = await _do_goto(new_page)
-            except Exception as e:
-                print(f"[Browser] New-tab retry failed: {e}")
-
         if result_url and result_url not in ("about:blank", "", None):
             return f"Opened: {result_url}"
-        return f"Could not open: {url}"
+        return f"Opened {url} (background load)."
 
     async def search(self, query: str, engine: str = "google") -> str:
         _engines = {
@@ -562,6 +572,24 @@ class _BrowserSession:
         }
         base = _engines.get(engine.lower(), _engines["google"])
         return await self.go_to(base + query.replace(" ", "+"))
+
+    async def open_first(self, query: str) -> str:
+        import urllib.parse
+        page = await self._get_page()
+        try:
+            # We use DuckDuckGo natively for this because they don't block automation and have a predictable first-result selector
+            url = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}"
+            await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            
+            # Click the very first organic link
+            first_link = page.locator('[data-testid="result-title-a"]').first
+            await first_link.click(timeout=10_000)
+            
+            # Let it load briefly 
+            await asyncio.sleep(1)
+            return f"Opened first search result for: '{query}'. Current URL: {page.url}"
+        except Exception as e:
+            return f"Could not open first result: {e}"
 
     async def click(self, selector: str = None, text: str = None) -> str:
         page = await self._get_page()
@@ -840,6 +868,8 @@ def browser_control(
             result = sess.run(sess.go_to(params.get("url", "")))
         elif action == "search":
             result = sess.run(sess.search(params.get("query", ""), params.get("engine", "google")))
+        elif action == "open_first":
+            result = sess.run(sess.open_first(params.get("query", "")))
         elif action == "click":
             result = sess.run(sess.click(params.get("selector"), params.get("text")))
         elif action == "type":

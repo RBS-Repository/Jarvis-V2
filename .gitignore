@@ -1,0 +1,50 @@
+# ====================================================================
+# Python Caches & Bytecode (Exclude)
+# ====================================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ====================================================================
+# Environments (Exclude if you create them later inside this folder)
+# ====================================================================
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ====================================================================
+# Local Configuration & Hidden Tools (Exclude)
+# ====================================================================
+.sixth/
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# ====================================================================
+# OS Generated Files
+# ====================================================================
+Thumbs.db
+Ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# ====================================================================
+# Project Specific Guidance (Explicitly Allowed)
+# ====================================================================
+# Keep your core modules, configuration blueprints, and dependency list
+!requirements.txt
+!main.py
+!setup.py
+!readme.md
+!config/
+!core/

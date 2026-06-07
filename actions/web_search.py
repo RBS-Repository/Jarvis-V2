@@ -105,6 +105,8 @@ def web_search(
     mode   = params.get("mode",  "search").lower().strip()
     items  = params.get("items", [])
     aspect = params.get("aspect", "general").strip() or "general"
+    save_as_docx = params.get("save_as_docx", False)
+    filename = params.get("filename", "search_results.docx")
 
     if not query and not items:
         return "Please provide a search query, sir."
@@ -122,19 +124,89 @@ def web_search(
             print(f"[WebSearch] 📊 Comparing: {items}")
             result = _compare(items, aspect)
             print("[WebSearch] ✅ Compare done.")
-            return result
+        else:
+            print("[WebSearch] 🌐 Trying Gemini...")
+            try:
+                result = _gemini_search(query)
+                print("[WebSearch] ✅ Gemini OK.")
+            except Exception as e:
+                print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
+                results = _ddg_search(query)
+                result  = _format_ddg(query, results)
+                print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
 
-        print("[WebSearch] 🌐 Trying Gemini...")
-        try:
-            result = _gemini_search(query)
-            print("[WebSearch] ✅ Gemini OK.")
-            return result
-        except Exception as e:
-            print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
-            results = _ddg_search(query)
-            result  = _format_ddg(query, results)
-            print(f"[WebSearch] ✅ DDG: {len(results)} result(s).")
-            return result
+        # Save to docx if requested
+        if save_as_docx and result:
+            try:
+                from docx import Document
+                from docx.shared import Pt
+                from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+                from pathlib import Path
+                
+                output_dir = Path(r"C:\Users\jaspe\OneDrive\Documents\Jarvis")
+                output_dir.mkdir(parents=True, exist_ok=True)
+                output_path = output_dir / filename
+                if not filename.endswith(".docx"):
+                    output_path = output_path.with_suffix(".docx")
+                
+                doc = Document()
+                
+                # Add main title with bold formatting
+                title = doc.add_heading(filename.replace(".docx", ""), 0)
+                title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+                for run in title.runs:
+                    run.font.size = Pt(18)
+                    run.font.bold = True
+                
+                # Process content with better formatting
+                lines = result.strip().split('\n')
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    
+                    # Detect headings (lines that end with colon or are short and uppercase)
+                    if line.endswith(':') or (len(line) < 50 and line.isupper()):
+                        # Add as heading with bold
+                        heading = doc.add_heading(line, level=1)
+                        for run in heading.runs:
+                            run.font.size = Pt(16)
+                            run.font.bold = True
+                    # Detect bullet points or numbered lists
+                    elif line.startswith(('•', '-', '*', '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
+                        paragraph = doc.add_paragraph(line, style='List Bullet')
+                        for run in paragraph.runs:
+                            run.font.size = Pt(12)
+                            run.font.bold = True
+                    # Regular paragraph - bold key terms before colon
+                    else:
+                        if ':' in line:
+                            parts = line.split(':', 1)
+                            if len(parts) == 2:
+                                paragraph = doc.add_paragraph()
+                                run = paragraph.add_run(parts[0] + ':')
+                                run.font.size = Pt(12)
+                                run.font.bold = True
+                                run = paragraph.add_run(parts[1])
+                                run.font.size = Pt(12)
+                            else:
+                                paragraph = doc.add_paragraph(line)
+                                for run in paragraph.runs:
+                                    run.font.size = Pt(12)
+                        else:
+                            paragraph = doc.add_paragraph(line)
+                            for run in paragraph.runs:
+                                run.font.size = Pt(12)
+                
+                doc.save(output_path)
+                print(f"[WebSearch] 📄 Saved to: {output_path}")
+                return f"{result}\n\nResearch saved to: {output_path}"
+            except Exception as e:
+                print(f"[WebSearch] ⚠️ Failed to save docx: {e}")
+                return result
+        
+        return result
 
     except Exception as e:
         print(f"[WebSearch] ❌ All backends failed: {e}")

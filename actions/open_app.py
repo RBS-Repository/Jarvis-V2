@@ -242,12 +242,26 @@ def open_app(
     if player:
         player.write_log(f"[open_app] {app_name}")
 
+    # Check if app is already running to avoid duplicates
+    if _PSUTIL:
+        search_term = normalized.lower().split(".")[0]
+        for proc in psutil.process_iter(['name']):
+            try:
+                if search_term in proc.info['name'].lower():
+                    print(f"[open_app] '{app_name}' is already running. Attempting to focus...")
+                    try:
+                        import pyautogui
+                        # Alt-Tab style focus attempt or just reporting
+                        return f"{app_name} is already running."
+                    except ImportError:
+                        return f"{app_name} is already running."
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
     try:
         if launcher(normalized):
             return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
+        
         return (
             f"Could not confirm that {app_name} launched. "
             f"It may still be loading, or it might not be installed."

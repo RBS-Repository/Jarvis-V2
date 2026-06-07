@@ -53,16 +53,22 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
 
 
-def _open_url(url: str) -> None:
+def _open_url_in_browser(url: str) -> None:
     try:
+        from actions.browser_control import _registry
+        # Use the common registry to ensure we stay in the same session
+        sess = _registry.get("chrome") # Default to chrome as it's the most stable for YT
+        # Instead of cmd /c start, we use the playwright session
+        sess.run(sess.go_to(url))
+    except Exception as e:
+        print(f"[YouTube] ⚠️ browser_control navigation failed: {e}. Falling back to system.")
+        # Final fallback to system open if playwright is blocked
         if is_mac():
             subprocess.Popen(["open", url])
         elif is_linux():
             subprocess.Popen(["xdg-open", url])
         else:
             subprocess.Popen(["cmd", "/c", "start", "", url], shell=False)
-    except Exception as e:
-        print(f"[YouTube] ⚠️ open_url failed: {e}")
 
 def _scrape_first_video_url(query: str) -> str | None:
 
@@ -281,8 +287,10 @@ def _handle_play(parameters: dict, player) -> str:
     video_url = _scrape_first_video_url(query)
 
     if video_url:
-        print(f"[YouTube] ▶️ Opening: {video_url}")
-        _open_url(video_url)
+        # Add autoplay parameter to URL
+        autoplay_url = video_url + ("&autoplay=1" if "?" in video_url else "?autoplay=1")
+        print(f"[YouTube] ▶️ Opening: {autoplay_url}")
+        _open_url_in_browser(autoplay_url)
         return f"Playing: {query}"
 
     print(f"[YouTube] ⚠️ Scrape failed, opening filtered search page")
@@ -291,7 +299,7 @@ def _handle_play(parameters: dict, player) -> str:
         f"?search_query={quote_plus(query)}"
         f"&sp={_YT_VIDEO_FILTER}"
     )
-    _open_url(fallback_url)
+    _open_url_in_browser(fallback_url)
     return f"Opened YouTube search for: {query} (manual selection required)"
 
 

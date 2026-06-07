@@ -25,7 +25,8 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 
 def _get_api_key() -> str:
@@ -35,8 +36,7 @@ def _get_api_key() -> str:
 
 
 def _gemini_client():
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel("gemini-2.5-flash")
+    return genai.Client(api_key=_get_api_key())
 
 
 def _detect_type(path: Path) -> str:
@@ -87,7 +87,7 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action in ("describe", "ocr", "analyze", "read", "extract_text"):
         try:
-            model  = _gemini_client()
+            client = _gemini_client()
             img    = Image.open(path)
             prompt = {
                 "describe": "Describe this image in detail.",
@@ -100,7 +100,10 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
             if params.get("instruction"):
                 prompt = params["instruction"]
 
-            response = model.generate_content([prompt, img])
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[prompt, img]
+            )
             result   = response.text.strip()
 
             if len(result) > 500 and params.get("save", True):
@@ -207,8 +210,11 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             "reformat":       f"Reformat this text cleanly with proper structure:\n\n{text}",
         }
         try:
-            model    = _gemini_client()
-            response = model.generate_content(prompt_map.get(action, f"Analyze:\n\n{text}"))
+            client   = _gemini_client()
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt_map.get(action, f"Analyze:\n\n{text}")
+            )
             result   = response.text.strip()
             if len(result) > 600 and params.get("save", True):
                 out = _output_path(path, action, ".txt")
@@ -233,14 +239,61 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
             return "Could not extract text to convert."
         try:
             from docx import Document
+            from docx.shared import Pt
+            from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
             doc  = Document()
-            doc.add_heading(path.stem, 0)
-            for para in text.split("\n\n"):
-                if para.strip():
-                    doc.add_paragraph(para.strip())
+            
+            # Add main title with bold formatting
+            title = doc.add_heading(path.stem, 0)
+            title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+            for run in title.runs:
+                run.font.size = Pt(18)
+                run.font.bold = True
+            
+            # Process content with better formatting
+            lines = text.strip().split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Detect headings (lines that end with colon or are short and uppercase)
+                if line.endswith(':') or (len(line) < 50 and line.isupper()):
+                    # Add as heading with bold
+                    heading = doc.add_heading(line, level=1)
+                    for run in heading.runs:
+                        run.font.size = Pt(16)
+                        run.font.bold = True
+                # Detect bullet points or numbered lists
+                elif line.startswith(('•', '-', '*', '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
+                    paragraph = doc.add_paragraph(line, style='List Bullet')
+                    for run in paragraph.runs:
+                        run.font.size = Pt(12)
+                        run.font.bold = True
+                # Regular paragraph - bold key terms before colon
+                else:
+                    if ':' in line:
+                        parts = line.split(':', 1)
+                        if len(parts) == 2:
+                            paragraph = doc.add_paragraph()
+                            run = paragraph.add_run(parts[0] + ':')
+                            run.font.size = Pt(12)
+                            run.font.bold = True
+                            run = paragraph.add_run(parts[1])
+                            run.font.size = Pt(12)
+                        else:
+                            paragraph = doc.add_paragraph(line)
+                            for run in paragraph.runs:
+                                run.font.size = Pt(12)
+                    else:
+                        paragraph = doc.add_paragraph(line)
+                        for run in paragraph.runs:
+                            run.font.size = Pt(12)
+            
             out = _output_path(path, "converted", ".docx")
             doc.save(out)
-            return f"Converted to Word document. Saved: {out.name}"
+            return f"Converted to Word document with bold formatting. Saved: {out.name}"
         except ImportError:
             return "python-docx not installed. Run: pip install python-docx"
 
@@ -297,8 +350,11 @@ def _process_text_doc(path: Path, file_type: str, action: str,
         instruction = action
 
     try:
-        model    = _gemini_client()
-        response = model.generate_content(prompt_map[action])
+        client   = _gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt_map[action]
+        )
         result   = response.text.strip()
         if len(result) > 600 and params.get("save", True):
             out = _output_path(path, action, ".txt")
@@ -344,8 +400,11 @@ def _process_data(path: Path, file_type: str, action: str,
                    f"Rows: {len(df)}\nPreview:\n{preview}\n\n"
                    f"Give insights, patterns, and notable findings.")
         try:
-            model    = _gemini_client()
-            response = model.generate_content(prompt)
+            client   = _gemini_client()
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
+            )
             return response.text.strip()
         except Exception as e:
             return f"AI analysis failed: {e}"
@@ -398,9 +457,10 @@ def _process_data(path: Path, file_type: str, action: str,
 
     preview = df.head(30).to_string()
     try:
-        model    = _gemini_client()
-        response = model.generate_content(
-            f"Task: {action}\nDataset ({len(df)} rows, cols: {list(df.columns)}):\n{preview}"
+        client   = _gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"Task: {action}\nDataset ({len(df)} rows, cols: {list(df.columns)}):\n{preview}"
         )
         return response.text.strip()
     except Exception as e:
@@ -429,8 +489,11 @@ def _process_json(path: Path, action: str, params: dict, speak=None) -> str:
         if params.get("instruction"):
             prompt = f"{params['instruction']}\n\nJSON data:\n{preview}"
         try:
-            model    = _gemini_client()
-            response = model.generate_content(prompt)
+            client   = _gemini_client()
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
+            )
             return response.text.strip()
         except Exception as e:
             return f"AI processing failed: {e}"
@@ -493,8 +556,11 @@ def _process_code(path: Path, action: str, params: dict, speak=None) -> str:
         prompt = prompt_map[action]
 
     try:
-        model    = _gemini_client()
-        response = model.generate_content(prompt)
+        client   = _gemini_client()
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt
+        )
         result   = response.text.strip()
 
         if action in ("fix", "optimize", "document") and params.get("save", True):
@@ -527,17 +593,20 @@ def _process_audio(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "transcribe":
         try:
-            model   = _gemini_client()
+            client  = _gemini_client()
             content = path.read_bytes()
             mime    = {
                 "mp3": "audio/mp3", "wav": "audio/wav",
                 "ogg": "audio/ogg", "m4a": "audio/mp4",
                 "aac": "audio/aac", "flac": "audio/flac",
             }.get(path.suffix.lstrip(".").lower(), "audio/mpeg")
-            response = model.generate_content([
-                "Transcribe all speech in this audio file accurately.",
-                {"mime_type": mime, "data": content}
-            ])
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=[
+                    "Transcribe all speech in this audio file accurately.",
+                    types.Part.from_bytes(data=content, mime_type=mime)
+                ]
+            )
             result = response.text.strip()
             if params.get("save", True):
                 out = _output_path(path, "transcript", ".txt")
@@ -764,16 +833,103 @@ def _process_pptx(path: Path, action: str, params: dict, speak=None) -> str:
             out.write_text(text, encoding="utf-8")
             return f"Text extracted. Saved: {out.name}"
         try:
-            model    = _gemini_client()
+            client   = _gemini_client()
             prompt   = f"{'Summarize' if action == 'summarize' else 'Analyze'} this presentation:\n{text[:30000]}"
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=prompt
+            )
             return response.text.strip()
         except Exception as e:
             return f"AI processing failed: {e}"
 
     return f"Unknown PPTX action: '{action}'. Try: summarize, extract_text, analyze"
 
+def create_docx_from_text(content: str, filename: str, output_dir: str = None) -> str:
+    """Create a Word document from text content with proper formatting."""
+    try:
+        from docx import Document
+        from docx.shared import Pt
+        from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
+    except ImportError:
+        return "python-docx not installed. Run: pip install python-docx"
+    
+    if output_dir is None:
+        output_dir = r"C:\Users\jaspe\OneDrive\Documents\Jarvis"
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    output_path = output_dir / filename
+    if not filename.endswith(".docx"):
+        output_path = output_path.with_suffix(".docx")
+    
+    doc = Document()
+    
+    # Add main title with bold formatting
+    title = doc.add_heading(filename.replace(".docx", ""), 0)
+    title.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
+    for run in title.runs:
+        run.font.size = Pt(18)
+        run.font.bold = True
+    
+    # Process content with better formatting
+    lines = content.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Detect headings (lines that end with colon or are short and uppercase)
+        if line.endswith(':') or (len(line) < 50 and line.isupper()):
+            # Add as heading with bold
+            heading = doc.add_heading(line, level=1)
+            for run in heading.runs:
+                run.font.size = Pt(16)
+                run.font.bold = True
+        # Detect bullet points or numbered lists
+        elif line.startswith(('•', '-', '*', '1.', '2.', '3.', '4.', '5.', '6.', '7.', '8.', '9.')):
+            paragraph = doc.add_paragraph(line, style='List Bullet')
+            for run in paragraph.runs:
+                run.font.size = Pt(12)
+                run.font.bold = True
+        # Regular paragraph - bold key terms before colon
+        else:
+            if ':' in line:
+                parts = line.split(':', 1)
+                if len(parts) == 2:
+                    paragraph = doc.add_paragraph()
+                    run = paragraph.add_run(parts[0] + ':')
+                    run.font.size = Pt(12)
+                    run.font.bold = True
+                    run = paragraph.add_run(parts[1])
+                    run.font.size = Pt(12)
+                else:
+                    paragraph = doc.add_paragraph(line)
+                    for run in paragraph.runs:
+                        run.font.size = Pt(12)
+            else:
+                paragraph = doc.add_paragraph(line)
+                for run in paragraph.runs:
+                    run.font.size = Pt(12)
+    
+    try:
+        doc.save(output_path)
+        return f"Word document created successfully: {output_path}"
+    except PermissionError:
+        return f"Permission denied. File may be open: {output_path}"
+    except Exception as e:
+        return f"Failed to save document: {e}"
+
 def file_processor(parameters: dict, player=None, speak=None) -> str:
+    # Handle docx creation from text content
+    if parameters.get("create_docx"):
+        content = parameters.get("content", "")
+        filename = parameters.get("filename", "document.docx")
+        output_dir = parameters.get("output_dir")
+        return create_docx_from_text(content, filename, output_dir)
+    
     file_path_str = parameters.get("file_path", "").strip()
     if not file_path_str:
         return "No file path provided."

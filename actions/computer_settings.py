@@ -97,9 +97,27 @@ def volume_set(value: int):
             vol.SetMasterVolumeLevel(vol_db, None)
             return
         except Exception as e:
-            print(f"[Settings] pycaw failed, using keypress fallback: {e}")
-            pyautogui.press("volumemute")
-            pyautogui.press("volumemute")
+            print(f"[Settings] pycaw failed, using PowerShell fallback: {e}")
+            # Fallback: Use PowerShell to set volume via nircmd or similar
+            try:
+                # Try using PowerShell with Add-Type to call Windows API
+                subprocess.run([
+                    "powershell", "-Command",
+                    f"$obj = New-Object -ComObject WScript.Shell; "
+                    f"for($i=0; $i -lt 50; $i++) {{ $obj.SendKeys([char]173) }}; "  # Volume down 50 times
+                    f"for($i=0; $i -lt {int(value/2)}; $i++) {{ $obj.SendKeys([char]175) }}"  # Volume up
+                ], capture_output=True, timeout=10)
+            except Exception as e2:
+                print(f"[Settings] PowerShell fallback failed: {e2}")
+                # Final fallback: use keypress
+                pyautogui.press("volumemute")
+                time.sleep(0.1)
+                pyautogui.press("volumemute")
+                time.sleep(0.1)
+                presses = int(value / 2)
+                for _ in range(presses):
+                    pyautogui.press("volumeup")
+                    time.sleep(0.05)
     elif _OS == "Darwin":
         subprocess.run(["osascript", "-e", f"set volume output volume {value}"],
             capture_output=True)
@@ -503,6 +521,7 @@ def shutdown_computer():
         subprocess.run(["systemctl", "poweroff"], capture_output=True)
 
 ACTION_MAP: dict[str, callable] = {
+    "volume":              volume_set,
     "volume_up":           volume_up,
     "volume_down":         volume_down,
     "mute":                volume_mute,
@@ -640,12 +659,26 @@ def computer_settings(
                 f"Please confirm by calling again with confirmed=yes."
             )
 
-    if action == "volume_set":
+    if action == "volume_set" or action == "volume":
         try:
             volume_set(int(value or 50))
             return f"Volume set to {value}%."
         except Exception as e:
             return f"Could not set volume: {e}"
+    
+    if action == "set":
+        # Handle generic "set" action by using intent detection on description
+        if description:
+            detected = _detect_action(description)
+            new_action = detected.get("action", "")
+            if value is None:
+                value = detected.get("value")
+            if new_action and new_action != "set":
+                # Recursively call with the detected action
+                params["action"] = new_action
+                params["description"] = ""
+                return computer_settings(parameters=params, response=response, player=player, session_memory=session_memory)
+        return "Could not determine what to set. Please specify what to set (e.g., volume to 50%)."
 
     if action in ("type_text", "write_on_screen", "type", "write"):
         text = str(value or params.get("text", "")).strip()

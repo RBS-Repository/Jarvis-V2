@@ -10,10 +10,27 @@ try:
 except ImportError:
     _SEND2TRASH = False
 
+try:
+    from openpyxl import Workbook
+    _OPENPYXL = True
+except ImportError:
+    _OPENPYXL = False
+
+try:
+    from docx import Document
+    from docx.shared import Pt
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    _PYTHON_DOCX = True
+except ImportError:
+    _PYTHON_DOCX = False
+
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
 _SAFE_ROOTS: list[Path] = [
     Path.home(),
+    Path.home() / "Documents",
+    Path.home() / "Desktop",
+    Path.home() / "Downloads",
 ]
 
 def _is_safe_path(target: Path) -> bool:
@@ -141,11 +158,175 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
         target = (base / name) if name else base
         if not _is_safe_path(target):
             return f"Access denied: {target}"
+        # If target is a directory, use it as parent and use name as filename
+        if target.is_dir() and name:
+            target = target / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return f"File created: {target.name}"
+        # Verify file was actually created
+        if not target.exists():
+            return f"Failed to create file: {target} (file does not exist after write)"
+        return f"File created: {target}"
+    except PermissionError as e:
+        return f"Permission denied: {target} - try using Desktop instead of OneDrive folders"
     except Exception as e:
         return f"Could not create file: {e}"
+
+
+def create_excel_file(path: str, name: str = "", data: str = "") -> str:
+    """Create an Excel (.xlsx) file with data. Data should be in CSV format or simple text."""
+    if not _OPENPYXL:
+        return "openpyxl is not installed. Run: pip install openpyxl"
+    try:
+        base   = _resolve_path(path)
+        target = (base / name) if name else base
+        if not target.suffix:
+            target = target.with_suffix(".xlsx")
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        # If target is a directory, use it as parent and use name as filename
+        if target.is_dir() and name:
+            target = target / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        
+        wb = Workbook()
+        ws = wb.active
+        
+        # Parse data (assume CSV-like format or simple text)
+        if data:
+            lines = data.strip().split('\n')
+            for row_idx, line in enumerate(lines, 1):
+                if ',' in line:
+                    # CSV format
+                    cells = [cell.strip() for cell in line.split(',')]
+                    for col_idx, cell_value in enumerate(cells, 1):
+                        ws.cell(row=row_idx, column=col_idx, value=cell_value)
+                else:
+                    # Simple text - put in first column
+                    ws.cell(row=row_idx, column=1, value=line)
+        
+        wb.save(str(target))
+        if not target.exists():
+            return f"Failed to create Excel file: {target}"
+        return f"Excel file created: {target}"
+    except PermissionError as e:
+        return f"Permission denied: {target} - try using Desktop instead of OneDrive folders"
+    except Exception as e:
+        return f"Could not create Excel file: {e}"
+
+
+def create_word_file(path: str, name: str = "", content: str = "") -> str:
+    """Create a Word (.docx) file with professional formatting and design."""
+    if not _PYTHON_DOCX:
+        return "python-docx is not installed. Run: pip install python-docx"
+    try:
+        base   = _resolve_path(path)
+        target = (base / name) if name else base
+        if not target.suffix:
+            target = target.with_suffix(".docx")
+        if not _is_safe_path(target):
+            return f"Access denied: {target}"
+        # If target is a directory, use it as parent and use name as filename
+        if target.is_dir() and name:
+            target = target / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        
+        doc = Document()
+        
+        # Set default font
+        style = doc.styles['Normal']
+        font = style.font
+        font.name = 'Calibri'
+        font.size = Pt(11)
+        
+        if content:
+            lines = content.split('\n')
+            current_paragraph = []
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    # Empty line - end current paragraph
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                elif line.startswith('# '):
+                    # Heading 1
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    doc.add_heading(line[2:], level=1)
+                elif line.startswith('## '):
+                    # Heading 2
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    doc.add_heading(line[3:], level=2)
+                elif line.startswith('### '):
+                    # Heading 3
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    doc.add_heading(line[4:], level=3)
+                elif line.startswith('- ') or line.startswith('* '):
+                    # Bullet point
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    doc.add_paragraph(line[2:], style='List Bullet')
+                elif line.startswith('1. ') or line.startswith('2. ') or line.startswith('3. '):
+                    # Numbered list
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    doc.add_paragraph(line[3:], style='List Number')
+                elif line.startswith('**') and line.endswith('**'):
+                    # Bold text
+                    if current_paragraph:
+                        para_text = ' '.join(current_paragraph)
+                        if para_text:
+                            p = doc.add_paragraph(para_text)
+                            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                        current_paragraph = []
+                    p = doc.add_paragraph()
+                    run = p.add_run(line[2:-2])
+                    run.bold = True
+                else:
+                    current_paragraph.append(line)
+            
+            # Add remaining paragraph
+            if current_paragraph:
+                para_text = ' '.join(current_paragraph)
+                if para_text:
+                    p = doc.add_paragraph(para_text)
+                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        
+        doc.save(str(target))
+        if not target.exists():
+            return f"Failed to create Word file: {target}"
+        return f"Word file created: {target}"
+    except PermissionError as e:
+        return f"Permission denied: {target} - try using Desktop instead of OneDrive folders"
+    except Exception as e:
+        return f"Could not create Word file: {e}"
 
 
 def create_folder(path: str, name: str = "") -> str:
@@ -487,6 +668,12 @@ def file_controller(
 
         elif action == "create_file":
             return create_file(path, name=name, content=params.get("content", ""))
+
+        elif action == "create_excel":
+            return create_excel_file(path, name=name, data=params.get("data", ""))
+
+        elif action == "create_word":
+            return create_word_file(path, name=name, content=params.get("content", ""))
 
         elif action == "create_folder":
             return create_folder(path, name=name)

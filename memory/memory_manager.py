@@ -15,7 +15,7 @@ BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
 _lock            = Lock()
 MAX_VALUE_LENGTH = 380
-MEMORY_MAX_CHARS = 2200
+MEMORY_MAX_CHARS = 10000
 
 def _empty_memory() -> dict:
     return {
@@ -25,6 +25,7 @@ def _empty_memory() -> dict:
         "relationships": {},
         "wishes":        {},
         "notes":         {},
+        "conversation_history": [],
     }
 
 def load_memory() -> dict:
@@ -47,6 +48,9 @@ def load_memory() -> dict:
 def _all_entries(memory: dict) -> list[tuple]:
     entries = []
     for cat, items in memory.items():
+        # Skip conversation_history from trimming - it's managed separately
+        if cat == "conversation_history":
+            continue
         if not isinstance(items, dict):
             continue
         for key, entry in items.items():
@@ -56,12 +60,18 @@ def _all_entries(memory: dict) -> list[tuple]:
 
 
 def _trim_to_limit(memory: dict) -> dict:
-    if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
+    # Calculate size excluding conversation_history
+    memory_without_history = {k: v for k, v in memory.items() if k != "conversation_history"}
+    size_without_history = len(json.dumps(memory_without_history, ensure_ascii=False))
+    
+    if size_without_history <= MEMORY_MAX_CHARS:
         return memory
+    
     entries = _all_entries(memory)
     entries.sort(key=lambda t: t[2].get("updated", "0000-00-00"))
     for cat, key, _ in entries:
-        if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
+        memory_without_history = {k: v for k, v in memory.items() if k != "conversation_history"}
+        if len(json.dumps(memory_without_history, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
             break
         del memory[cat][key]
         print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
@@ -192,6 +202,53 @@ def format_memory_for_prompt(memory: dict | None) -> str:
         result = result[:1997] + "…"
 
     return result + "\n"
+
+
+def add_conversation_entry(user_input: str, jarvis_response: str) -> None:
+    """Add a conversation entry to memory for context tracking."""
+    memory = load_memory()
+    history = memory.get("conversation_history", [])
+    
+    # Ensure history is a list
+    if not isinstance(history, list):
+        history = []
+    
+    # Add new entry
+    entry = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": user_input[:200],  # Truncate long inputs
+        "jarvis": jarvis_response[:200]  # Truncate long responses
+    }
+    history.append(entry)
+    
+    # Keep only last 20 conversations
+    if len(history) > 20:
+        history = history[-20:]
+    
+    memory["conversation_history"] = history
+    save_memory(memory)
+
+
+def get_recent_context(limit: int = 5) -> str:
+    """Get recent conversation context for context-aware responses."""
+    memory = load_memory()
+    history = memory.get("conversation_history", [])
+    
+    if not history:
+        return ""
+    
+    recent = history[-limit:]
+    lines = ["[RECENT CONVERSATION CONTEXT - use this to understand context]"]
+    
+    for entry in recent:
+        timestamp = entry.get("timestamp", "")
+        user_input = entry.get("user", "")
+        jarvis_response = entry.get("jarvis", "")
+        lines.append(f"{timestamp}")
+        lines.append(f"  User: {user_input}")
+        lines.append(f"  Jarvis: {jarvis_response}")
+    
+    return "\n".join(lines) + "\n"
 
 def remember(key: str, value: str, category: str = "notes") -> str:
     valid = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}

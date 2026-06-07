@@ -3,16 +3,33 @@ import re
 import threading
 import json
 import sys
+import time
 import traceback
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
 from google import genai
 from google.genai import types
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
+    add_conversation_entry, get_recent_context,
 )
+
+# --- OPENWAKEWORD IMPORT ---
+try:
+    # Set cache directory before importing to avoid OneDrive permission issues
+    import os
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    cache_dir = os.path.join(desktop, ".openwakeword_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["XDG_CACHE_HOME"] = cache_dir
+    
+    from openwakeword.model import Model as OWWModel
+    _OWW_OK = True
+except ImportError:
+    _OWW_OK = False
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -31,6 +48,9 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.sticky_note       import write_sticky_note
+from actions.google_workspace  import google_workspace
+from actions.calendar          import calendar_action
 
 
 def get_base_dir():
@@ -45,8 +65,8 @@ PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
-RECEIVE_SAMPLE_RATE = 24000
-CHUNK_SIZE          = 1024
+RECEIVE_SAMPLE_RATE = 23200  # Slightly lower than 24k to deepen the voice and slow down pacing
+CHUNK_SIZE          = 1280
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -91,16 +111,45 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "Searches the web for any information.",
+        "description": "Searches the web for any information. Can save results directly to a Word document with save_as_docx parameter.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "query":  {"type": "STRING", "description": "Search query"},
                 "mode":   {"type": "STRING", "description": "search (default) or compare"},
                 "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
-                "aspect": {"type": "STRING", "description": "price | specs | reviews"}
+                "aspect": {"type": "STRING", "description": "price | specs | reviews"},
+                "save_as_docx": {"type": "BOOLEAN", "description": "Set to true to save search results directly to a Word document with proper formatting"},
+                "filename": {"type": "STRING", "description": "Filename for the Word document (used with save_as_docx, defaults to search_results.docx)"}
             },
             "required": ["query"]
+        }
+    },
+    {
+        "name": "set_standby",
+        "description": "Sets JARVIS to standby mode (sleep) or wakes him up.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "enabled": {
+                    "type": "BOOLEAN",
+                    "description": "True to go to sleep, False to wake up."
+                }
+            },
+            "required": ["enabled"]
+        }
+    },
+    {
+        "name": "save_memory",
+        "description": "Stores important information about the user or preferences into long-term memory.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING", "description": "Category: identity, preferences, relationships, etc."},
+                "key":      {"type": "STRING", "description": "Short unique identifier for the info"},
+                "value":    {"type": "STRING", "description": "The information content"}
+            },
+            "required": ["category", "key", "value"]
         }
     },
     {
@@ -112,6 +161,17 @@ TOOL_DECLARATIONS = [
                 "city": {"type": "STRING", "description": "City name"}
             },
             "required": ["city"]
+        }
+    },
+    {
+        "name": "write_sticky_note",
+        "description": "Writes a list, task, or note to Windows Sticky Notes.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "text": {"type": "STRING", "description": "The exact text or list to write. Format it with line breaks if it's a list."}
+            },
+            "required": ["text"]
         }
     },
     {
@@ -205,7 +265,7 @@ TOOL_DECLARATIONS = [
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
+                "action":      {"type": "STRING", "description": "go_to | search | open_first | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
                 "browser":     {"type": "STRING", "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."},
                 "url":         {"type": "STRING", "description": "URL for go_to / new_tab action"},
                 "query":       {"type": "STRING", "description": "Search query for search action"},
@@ -225,15 +285,16 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage. Can create Excel (.xlsx) and Word (.docx) files.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
+                "action":      {"type": "STRING", "description": "list | create_file | create_excel | create_word | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
                 "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
                 "destination": {"type": "STRING", "description": "Destination path for move/copy"},
                 "new_name":    {"type": "STRING", "description": "New name for rename"},
-                "content":     {"type": "STRING", "description": "Content for create_file/write"},
+                "content":     {"type": "STRING", "description": "Content for create_file/write/create_word"},
+                "data":        {"type": "STRING", "description": "Data for create_excel (CSV format or simple text)"},
                 "name":        {"type": "STRING", "description": "File name to search for"},
                 "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
                 "count":       {"type": "INTEGER", "description": "Number of results for largest"},
@@ -397,6 +458,7 @@ TOOL_DECLARATIONS = [
         "video (trim/extract_audio/extract_frame/compress/transcribe/info), "
         "archives (list/extract), "
         "presentations (summarize/extract_text). "
+        "Can also create Word documents from text content with create_docx parameter. "
         "ALWAYS call this tool when a file has been uploaded and the user gives a command about it. "
         "If the user's command is ambiguous, pick the most logical action for that file type."
     ),
@@ -444,10 +506,14 @@ TOOL_DECLARATIONS = [
             "ascending": {"type": "BOOLEAN", "description": "Sort order for CSV sort (default: true)"},
             "save":      {"type": "BOOLEAN", "description": "Save result to file (default: true)"},
             "destination": {"type": "STRING", "description": "Output folder for archive extract"},
+            "create_docx": {"type": "BOOLEAN", "description": "Set to true to create a Word document from text content"},
+            "content": {"type": "STRING", "description": "Text content to create Word document from (used with create_docx)"},
+            "filename": {"type": "STRING", "description": "Filename for the Word document to create (used with create_docx)"},
+            "output_dir": {"type": "STRING", "description": "Output directory for the Word document (optional, defaults to Jarvis directory)"},
         },
         "required": []
     }
-},
+    },
     {
         "name": "save_memory",
         "description": (
@@ -478,6 +544,45 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "google_workspace",
+        "description": "Interacts with Google Calendar and Gmail. Can open calendar/gmail, add calendar events, check calendar schedule, and compose emails.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "open_calendar | open_gmail | add_event | check_calendar | compose_email | check_email"},
+                "title":       {"type": "STRING", "description": "Title for calendar event"},
+                "date":        {"type": "STRING", "description": "Date for event/calendar view (e.g. '2026-06-10', 'tomorrow')"},
+                "time":        {"type": "STRING", "description": "Time for event (e.g. '14:00', '2pm')"},
+                "duration":    {"type": "INTEGER", "description": "Duration in minutes (default 60)"},
+                "description": {"type": "STRING", "description": "Event description"},
+                "location":    {"type": "STRING", "description": "Event location"},
+                "view":        {"type": "STRING", "description": "day | week | month for check_calendar"},
+                "to":          {"type": "STRING", "description": "Recipient email address for compose"},
+                "subject":     {"type": "STRING", "description": "Email subject"},
+                "body":        {"type": "STRING", "description": "Email body content"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "calendar",
+        "description": "Manages Google Calendar events: list, create, delete, and update events.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "list | create | delete | update"},
+                "summary": {"type": "STRING", "description": "Event title (for create/update)"},
+                "description": {"type": "STRING", "description": "Event description (for create/update)"},
+                "location": {"type": "STRING", "description": "Event location (for create/update)"},
+                "start_time": {"type": "STRING", "description": "Start time in ISO format (for create/update), e.g., '2024-01-01T10:00:00'"},
+                "end_time": {"type": "STRING", "description": "End time in ISO format (for create/update), e.g., '2024-01-01T11:00:00'"},
+                "event_id": {"type": "STRING", "description": "Event ID (for delete/update)"},
+                "max_results": {"type": "INTEGER", "description": "Maximum number of events to return (for list, default: 10)"}
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 class JarvisLive:
@@ -487,9 +592,13 @@ class JarvisLive:
         self.session        = None
         self.audio_in_queue = None
         self.out_queue      = None
+        self.standby        = False
         self._loop          = None
         self._is_speaking   = False
+        self._interrupted   = False
         self._speaking_lock = threading.Lock()
+        self._standby_enter_time = 0 # To prevent immediate re-wake
+        self._init_oww() # Init wake word engine
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
 
@@ -509,6 +618,8 @@ class JarvisLive:
             self._is_speaking = value
         if value:
             self.ui.set_state("SPEAKING")
+        elif self.standby:
+            self.ui.set_state("STANDBY")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
@@ -517,11 +628,25 @@ class JarvisLive:
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
+                turns=[types.Content(parts=[types.Part(text=text)])],
                 turn_complete=True
             ),
             self._loop
         )
+
+    def _init_oww(self):
+        if _OWW_OK:
+            try:
+                print("[JARVIS] 🧠 Initializing Wake Word Engine...")
+                self._oww_model = OWWModel(wakeword_models=["jarvis"], inference_framework="onnx")
+                print("[JARVIS] ✅ Wake Word Engine Ready (Jarvis)")
+            except Exception as e:
+                print(f"[JARVIS] ⚠️ Wake Word Initialization failed: {e}")
+                print("[JARVIS] ℹ️  Continuing without wake word detection. You can still use the UI.")
+                self._oww_model = None
+        else:
+            print("[JARVIS] ℹ️  OpenWakeWord not installed. Wake word detection disabled.")
+            self._oww_model = None
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
@@ -534,6 +659,7 @@ class JarvisLive:
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
         sys_prompt = _load_system_prompt()
+        context_str = get_recent_context(limit=5)
 
         now      = datetime.now()
         time_str = now.strftime("%A, %B %d, %Y — %I:%M %p")
@@ -544,6 +670,8 @@ class JarvisLive:
         )
 
         parts = [time_ctx]
+        if context_str:
+            parts.append(context_str)
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
@@ -568,8 +696,17 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        # Truncate long parameter values for cleaner logging
+        truncated_args = {}
+        for key, value in args.items():
+            if isinstance(value, str) and len(value) > 100:
+                truncated_args[key] = value[:97] + "..."
+            else:
+                truncated_args[key] = value
+        print(f"[JARVIS] 🔧 {name}  {truncated_args}")
         self.ui.set_state("THINKING")
+        if not self.ui.muted and not getattr(self, "standby", False):
+            self.ui.play_sound("working.mp3")
 
         if name == "save_memory":
             category = args.get("category", "notes")
@@ -674,13 +811,54 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                self.speak("Goodbye, sir.")
+                self.ui.write_log("SYS: Shutdown sequence initiated.")
                 def _shutdown():
                     import time, os
-                    time.sleep(1)
+                    # 7 seconds allows the long sign-off string to finish speaking
+                    time.sleep(7)
+                    print("[JARVIS] 🔴 Systems offline. Shutdown complete.")
                     os._exit(0)
                 threading.Thread(target=_shutdown, daemon=True).start()
+                result = "Shutdown sequence initiated. Please finish your final sign-off, JARVIS."
+
+            elif name == "write_sticky_note":
+                text = args.get("text", "")
+                result = write_sticky_note(text)
+
+            elif name == "google_workspace":
+                r = await loop.run_in_executor(None, lambda: google_workspace(parameters=args, player=self.ui, speak=self.speak))
+                result = r or "Done."
+
+            elif name == "spotify_control":
+                r = await loop.run_in_executor(None, lambda: spotify_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "calendar":
+                r = await loop.run_in_executor(None, lambda: calendar_action(parameters=args, response=None, player=self.ui, session_memory=None))
+                result = r or "Done."
+
+            elif name == "set_standby":
+                enabled = args.get("enabled", False)
+                self.standby = enabled
+                if enabled:
+                    self._standby_enter_time = time.time()
+                    if self._oww_model:
+                        try: self._oww_model.reset()
+                        except: pass
+                    
+                    def _play_standby():
+                        import time
+                        time.sleep(6.5) # Wait for speech to finish
+                        self.ui.play_sound("standby.mp3")
+                    threading.Thread(target=_play_standby, daemon=True).start()
+                    
+                    self.ui.set_state("STANDBY")
+                    self.ui.write_log("SYS: Standby mode activated.")
+                    result = "Standby mode activated. I am now silent until you say 'Wake up, Jarvis'."
+                else:
+                    self.ui.set_state("LISTENING")
+                    self.ui.write_log("SYS: Systems active.")
+                    result = "I am awake and at your service, sir."
 
             else:
                 result = f"Unknown tool: {name}"
@@ -691,7 +869,8 @@ class JarvisLive:
             self.speak_error(name, e)
 
         if not self.ui.muted:
-            self.ui.set_state("LISTENING")
+            new_state = "STANDBY" if self.standby else "LISTENING"
+            self.ui.set_state(new_state)
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
         return types.FunctionResponse(
@@ -709,14 +888,76 @@ class JarvisLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            if self.ui.muted:
+                return
+
+            # Simple Volume Calculation
+            volume = np.linalg.norm(indata) / np.sqrt(len(indata))
+            
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
-                data = indata.tobytes()
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
+
+            # Standard Listening Logic:
+            # If JARVIS is talking, we usually don't want to send mic data 
+            # unless we want barge-in. Since we now use a manual button,
+            # we'll only listen when he's silent or if a button is pushed.
+            # But the server is good at filtering echo, so we can just send.
+            
+            # Calculate audio level for visualization
+            audio_level = np.sqrt(np.mean(indata.astype(np.float32) ** 2)) / 32768.0
+            loop.call_soon_threadsafe(self.ui._win.hud.update_audio_level, min(1.0, audio_level * 5.0), True)
+            
+            # Apply noise reduction
+            try:
+                import noisereduce as nr
+                # Convert to float for noise reduction
+                audio_float = indata.astype(np.float32)
+                # Simple noise gate - reduce low-level noise
+                noise_gate_threshold = 0.01
+                if audio_level < noise_gate_threshold:
+                    audio_float = audio_float * 0.1  # Attenuate low-level noise
+                indata = audio_float.astype(np.int16)
+            except ImportError:
+                pass  # noisereduce not installed, skip noise reduction
+            except Exception as e:
+                if self._tick % 100 == 0:
+                    print(f"[JARVIS] ⚠️ Noise reduction error: {e}")
+            
+            if not jarvis_speaking:
+                if self.standby and self._oww_model:
+                    # LOCAL WAKE WORD DETECTION
+                    if time.time() - self._standby_enter_time < 5.0:
+                        return # Cooling down to prevent immediate re-wake
+
+                    try:
+                        raw_data = indata.flatten()
+                        predictions = self._oww_model.predict(raw_data)
+                        
+                        # Log scores periodically or if any score > 0.1 to avoid spam
+                        for m_name, score in predictions.items():
+                            if score > 0.12:
+                                print(f"[OWW] Detect: {m_name} | Score: {score:.3f}")
+                            
+                            # WAKE LOGIC - Extreme sensitivity for "Jarvis"
+                            if score > 0.15:
+                                print(f"[JARVIS] 🔔 Wake word triggered by '{m_name}' (Score: {score:.2f})")
+                                self.standby = False
+                                loop.call_soon_threadsafe(self.ui.set_state, "LISTENING")
+                                loop.call_soon_threadsafe(self.ui.play_sound, "startup.mp3")
+                                loop.call_soon_threadsafe(self.ui.write_log, "SYS: Wake word detected.")
+                                # SYNCHRONIZE WITH SERVER
+                                self.speak("Wake up, Jarvis.")
+                                break
+                    except Exception as e:
+                        if self._tick % 100 == 0:
+                            print(f"[JARVIS] ⚠️ OWW Predict error: {e}")
+                elif not self.standby:
+                    # NORMAL STREAMING TO SERVER
+                    data = indata.tobytes()
+                    loop.call_soon_threadsafe(
+                        self.out_queue.put_nowait,
+                        {"data": data, "mime_type": "audio/pcm"}
+                    )
 
         try:
             with sd.InputStream(
@@ -742,6 +983,7 @@ class JarvisLive:
                 async for response in self.session.receive():
 
                     if response.data:
+                        self._interrupted = False # Reset on new chunk
                         if self._turn_done_event and self._turn_done_event.is_set():
                             self._turn_done_event.clear()
                         self.audio_in_queue.put_nowait(response.data)
@@ -772,19 +1014,37 @@ class JarvisLive:
                             if full_out:
                                 self.ui.write_log(f"Jarvis: {full_out}")
                             out_buf = []
+                            
+                            # Track conversation for context-aware responses
+                            if full_in and full_out:
+                                try:
+                                    add_conversation_entry(full_in, full_out)
+                                except Exception as e:
+                                    print(f"[JARVIS] ⚠️ Conversation tracking error: {e}")
 
                     if response.tool_call:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
+                            
+                            # IMMEDIATE WAKE-UP GUARD:
+                            # If we see a wake-up call, drop standby immediately 
+                            # so the upcoming audio doesn't get discarded.
+                            if fc.name == "set_standby":
+                                try:
+                                    # Peek at args to see if it's wake up
+                                    if not fc.args.get("enabled", True):
+                                        self.standby = False
+                                except: pass
+
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
+            if "1006" not in str(e) and "1011" not in str(e):
+                print(f"[JARVIS] ❌ Recv error: {e}")
             raise
 
     async def _play_audio(self):
@@ -797,6 +1057,17 @@ class JarvisLive:
             blocksize=CHUNK_SIZE,
         )
         stream.start()
+
+        import numpy as np
+        
+        # Ring modulation parameters 
+        mod_freq = 40.0  
+        phase = 0.0      
+        
+        # Echo / Reverb parameters
+        echo_delay_ms = 80.0 # 70 ms creates a nice spacious "helmet" or room echo
+        delay_samples = int(RECEIVE_SAMPLE_RATE * (echo_delay_ms / 1000.0))
+        echo_buffer = np.zeros(0, dtype=np.float32)
 
         try:
             while True:
@@ -814,7 +1085,49 @@ class JarvisLive:
                         self.set_speaking(False)
                         self._turn_done_event.clear()
                     continue
+                
                 self.set_speaking(True)
+
+                # Check if we've been interrupted since the last chunk
+                if self._interrupted:
+                    self.set_speaking(False)
+                    continue
+
+                # --- APPLY ROBOTIC & ECHO EFFECT ---
+                audio_data = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+                chunk_len = len(audio_data)
+                
+                # 1. Ring Modulator (Robotic flutter)
+                t = (np.arange(chunk_len) + phase) / RECEIVE_SAMPLE_RATE
+                sine_wave = np.sin(2 * np.pi * mod_freq * t)
+                phase += chunk_len
+
+                # Slightly reduce flutter (75/25) so the echo doesn't get too messy
+                ring_mod = audio_data * sine_wave
+                blended = (audio_data * 0.75) + (ring_mod * 0.25)
+                
+                # 2. Echo (Helmet / Room Reverb)
+                echo_buffer = np.concatenate((echo_buffer, blended))
+                echo_signal = np.zeros(chunk_len, dtype=np.float32)
+                
+                # If we have enough history, grab the delayed chunk
+                if len(echo_buffer) >= delay_samples + chunk_len:
+                    echo_signal = echo_buffer[-(delay_samples + chunk_len):-delay_samples]
+                elif len(echo_buffer) > delay_samples:
+                    available = len(echo_buffer) - delay_samples
+                    echo_signal[-available:] = echo_buffer[-len(echo_buffer):-delay_samples]
+
+                # Cap buffer length to save memory (max 1 second of audio)
+                if len(echo_buffer) > RECEIVE_SAMPLE_RATE:
+                    echo_buffer = echo_buffer[-RECEIVE_SAMPLE_RATE:]
+
+                # Mix current audio with the echo (echo volume = 35%)
+                final_audio = blended + (echo_signal * 0.35)
+                
+                # Convert back to audio bytes
+                chunk = np.clip(final_audio, -32768, 32767).astype(np.int16).tobytes()
+                # ---------------------------------
+                
                 await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
@@ -823,6 +1136,15 @@ class JarvisLive:
             self.set_speaking(False)
             stream.stop()
             stream.close()
+
+    def _handle_interrupt(self):
+        """Clears playback queue to stop JARVIS from speaking immediately."""
+        self._interrupted = True
+        if hasattr(self, 'audio_in_queue'):
+            while not self.audio_in_queue.empty():
+                try: self.audio_in_queue.get_nowait()
+                except: break
+        print("[JARVIS] 🛑 Manual interruption handled")
 
     async def run(self):
         client = genai.Client(
@@ -843,11 +1165,15 @@ class JarvisLive:
                     self.session        = session
                     self._loop          = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
+                    self.out_queue      = asyncio.Queue()
                     self._turn_done_event = asyncio.Event()
 
                     print("[JARVIS] ✅ Connected.")
+                    self.ui.play_startup_sound()
+                    await asyncio.sleep(2.0)
+
                     self.ui.set_state("LISTENING")
+
                     self.ui.write_log("SYS: JARVIS online.")
 
                     tg.create_task(self._send_realtime())
@@ -855,20 +1181,65 @@ class JarvisLive:
                     tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
 
+                    # Auto-trigger the first greeting
+                    await self.session.send_client_content(
+                        turns=[types.Content(parts=[types.Part(text="Hello. I'm online.")])],
+                        turn_complete=True
+                    )
+
+            except BaseExceptionGroup as eg:
+                # TaskGroup raises an ExceptionGroup. Check the full traceback if it's a routine connection drop
+                full_trace = "".join(traceback.format_exception(type(eg), eg, eg.__traceback__))
+                if "1006" in full_trace or "1011" in full_trace or "TimeoutError" in full_trace:
+                    print("[JARVIS] ⚠️ Server connection reset. Restarting...")
+                else:
+                    print(f"[JARVIS] ⚠️ Unhandled connection error:")
+                    traceback.print_exc()
             except Exception as e:
-                print(f"[JARVIS] ⚠️ {e}")
+                print(f"[JARVIS] ⚠️ Exception: {e}")
                 traceback.print_exc()
+                
             self.set_speaking(False)
-            self.ui.set_state("THINKING")
+            if not self.standby:
+                self.ui.set_state("THINKING")
             print("[JARVIS] 🔄 Reconnecting in 3s...")
             await asyncio.sleep(3)
 
 def main():
+    import os
+    import sys
+    os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+    os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+    sys.argv.extend(["-platform", "windows:dpiawareness=0"])
+    
     ui = JarvisUI("face.png")
+    class UILogger:
+        def __init__(self, ui, old_out):
+            self.ui = ui
+            self.old = old_out
+            self.buf = ""
+        def write(self, text):
+            self.old.write(text)
+            self.buf += text
+            if '\n' in self.buf:
+                lines = self.buf.split('\n')
+                for line in lines[:-1]:
+                    clean_line = line.strip()
+                    if clean_line and "[UI] State Transition" not in clean_line and "Could not update timestamps" not in clean_line and "mp3float" not in clean_line:
+                        try:
+                            # Use loop call_soon_threadsafe if possible, else direct
+                            self.ui.write_log(clean_line)
+                        except: pass
+                self.buf = lines[-1]
+        def flush(self):
+            self.old.flush()
+
+    sys.stdout = UILogger(ui, sys.stdout)
 
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
+        ui.on_interrupt = jarvis._handle_interrupt
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
