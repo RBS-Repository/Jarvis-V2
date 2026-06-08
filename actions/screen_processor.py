@@ -334,13 +334,19 @@ class _VisionSession:
                     chunk = sc.output_transcription.text.strip()
                     if chunk:
                         transcript.append(chunk)
+                        if self._player and hasattr(self._player, "stream_chat"):
+                            self._player.stream_chat("jarvis", chunk)
 
                 if sc.turn_complete:
-                    if transcript and self._player:
+                    if transcript:
                         full = re.sub(r"\s+", " ", " ".join(transcript)).strip()
                         if full:
-                            self._player.write_log(f"Jarvis: {full}")
                             print(f"[Vision] 💬 {full}")
+                    if self._player:
+                        if hasattr(self._player, "finish_chat_stream"):
+                            self._player.finish_chat_stream("jarvis")
+                        if hasattr(self._player, "vision_ended"):
+                            self._player.vision_ended()
                     transcript = []
 
         except Exception as e:
@@ -398,10 +404,15 @@ def screen_process(
 
     print(f"[Vision] ▶ angle={angle!r}  question='{user_text[:80]}'")
 
+    def _release_vision():
+        if player and hasattr(player, "vision_ended"):
+            player.vision_ended()
+
     try:
         _ensure_session(player=player)
     except Exception as e:
         print(f"[Vision] ❌ Could not start session: {e}")
+        _release_vision()
         return False
 
     try:
@@ -413,6 +424,7 @@ def screen_process(
             print(f"[Vision] 🖥️  Screen: {len(image_bytes):,} bytes")
     except Exception as e:
         print(f"[Vision] ❌ Capture error: {e}")
+        _release_vision()
         return False
 
     _session.analyze(image_bytes, mime_type, user_text)

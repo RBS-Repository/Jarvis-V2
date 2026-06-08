@@ -111,12 +111,19 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "web_search",
-        "description": "Searches the web for any information. Can save results directly to a Word document with save_as_docx parameter.",
+        "description": (
+            "Searches the web for information. For Philippine news or headlines, ALWAYS use "
+            "mode 'ph_headlines' (or include rappler/inquirer in query) — pulls latest stories "
+            "from rappler.com and inquirer.net. Can save results to Word with save_as_docx."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "query":  {"type": "STRING", "description": "Search query"},
-                "mode":   {"type": "STRING", "description": "search (default) or compare"},
+                "mode":   {
+                    "type": "STRING",
+                    "description": "search (default), compare, or ph_headlines for Rappler/Inquirer news",
+                },
                 "items":  {"type": "ARRAY", "items": {"type": "STRING"}, "description": "Items to compare"},
                 "aspect": {"type": "STRING", "description": "price | specs | reviews"},
                 "save_as_docx": {"type": "BOOLEAN", "description": "Set to true to save search results directly to a Word document with proper formatting"},
@@ -597,6 +604,7 @@ class JarvisLive:
         self._is_speaking   = False
         self._interrupted   = False
         self._speaking_lock = threading.Lock()
+        self._vision_active = threading.Event()
         self._standby_enter_time = 0 # To prevent immediate re-wake
         self._init_oww() # Init wake word engine
         self.ui.on_text_command = self._on_text_command
@@ -619,6 +627,19 @@ class JarvisLive:
         if value:
             self.ui.set_state("SPEAKING")
         elif self.standby:
+            self.ui.set_state("STANDBY")
+        elif not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
+    def begin_vision(self):
+        """Block main-session audio while the vision module speaks."""
+        self._vision_active.set()
+        self._handle_interrupt()
+        self.ui.set_state("SPEAKING")
+
+    def end_vision(self):
+        self._vision_active.clear()
+        if self.standby:
             self.ui.set_state("STANDBY")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -755,13 +776,18 @@ class JarvisLive:
                 result = r or "Done."
 
             elif name == "screen_process":
+                self.begin_vision()
                 threading.Thread(
                     target=screen_process,
                     kwargs={"parameters": args, "response": None,
                             "player": self.ui, "session_memory": None},
                     daemon=True
                 ).start()
-                result = "Vision module activated. Stay completely silent — vision module will speak directly."
+                result = (
+                    "[VISION_HANDOFF] Screen analysis is running on a separate channel. "
+                    "Produce absolutely no audio and no spoken response. "
+                    "Remain completely silent until the vision module finishes."
+                )
 
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
@@ -942,8 +968,7 @@ class JarvisLive:
                             if score > 0.15:
                                 print(f"[JARVIS] 🔔 Wake word triggered by '{m_name}' (Score: {score:.2f})")
                                 self.standby = False
-                                loop.call_soon_threadsafe(self.ui.set_state, "LISTENING")
-                                loop.call_soon_threadsafe(self.ui.play_sound, "startup.mp3")
+                                loop.call_soon_threadsafe(self.ui.play_startup_sequence)
                                 loop.call_soon_threadsafe(self.ui.write_log, "SYS: Wake word detected.")
                                 # SYNCHRONIZE WITH SERVER
                                 self.speak("Wake up, Jarvis.")
@@ -995,24 +1020,23 @@ class JarvisLive:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt:
                                 out_buf.append(txt)
+                                self.ui.stream_chat("jarvis", txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
                                 in_buf.append(txt)
+                                self.ui.stream_chat("you", txt)
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
 
                             full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                            in_buf = []
-
                             full_out = " ".join(out_buf).strip()
-                            if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                            self.ui.finish_chat_stream("you")
+                            self.ui.finish_chat_stream("jarvis")
+                            in_buf = []
                             out_buf = []
                             
                             # Track conversation for context-aware responses
@@ -1085,6 +1109,10 @@ class JarvisLive:
                         self.set_speaking(False)
                         self._turn_done_event.clear()
                     continue
+
+                # Vision module owns audio output — discard main session chunks
+                if self._vision_active.is_set():
+                    continue
                 
                 self.set_speaking(True)
 
@@ -1155,7 +1183,8 @@ class JarvisLive:
         while True:
             try:
                 print("[JARVIS] 🔌 Connecting...")
-                self.ui.set_state("THINKING")
+                if not self.standby:
+                    self.ui.set_state("THINKING")
                 config = self._build_config()
 
                 async with (
@@ -1169,8 +1198,8 @@ class JarvisLive:
                     self._turn_done_event = asyncio.Event()
 
                     print("[JARVIS] ✅ Connected.")
-                    self.ui.play_startup_sound()
-                    await asyncio.sleep(2.0)
+                    self.ui.play_startup_sequence()
+                    await asyncio.to_thread(self.ui.wait_for_startup_init)
 
                     self.ui.set_state("LISTENING")
 
@@ -1240,6 +1269,8 @@ def main():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
         ui.on_interrupt = jarvis._handle_interrupt
+        ui._vision_start_cb = jarvis.begin_vision
+        ui._vision_end_cb = jarvis.end_vision
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:

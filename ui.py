@@ -14,7 +14,7 @@ from pathlib import Path
 import psutil
 
 from PyQt6.QtCore import (
-    QEasingCurve, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
+    QEasingCurve, QEvent, QMimeData, QObject, QPointF, QRectF, QSize, Qt,
     QTimer, QUrl, pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -38,10 +38,10 @@ BASE_DIR   = _base_dir()
 CONFIG_DIR = BASE_DIR / "config"
 API_FILE   = CONFIG_DIR / "api_keys.json"
 
-_DEFAULT_W, _DEFAULT_H = 980, 700
-_MIN_W,     _MIN_H     = 820, 580
-_LEFT_W  = 148
-_RIGHT_W = 340
+_DEFAULT_W, _DEFAULT_H = 1176, 840
+_MIN_W,     _MIN_H     = 984, 696
+_LEFT_W  = 180
+_RIGHT_W = 400
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -253,7 +253,8 @@ class HudCanvas(QWidget):
 
         self.muted    = False
         self.speaking = False
-        self.state    = "INITIALISING"
+        self.state    = "THINKING"
+        self._standby_blend = 0.0
 
         self._tick       = 0
         self._scale      = 1.0
@@ -266,22 +267,25 @@ class HudCanvas(QWidget):
         self._scan3      = 90.0
 
         # Wake-up animation state
-        self._wake_up_progress = 0.0
-        self._wake_up_active = True
+        self._wake_up_progress = 1.0
+        self._wake_up_active = False
+        self._wake_up_external = False
 
         # Audio visualizer state
         self._audio_level_input = 0.0
         self._audio_level_output = 0.0
         self._audio_history = [0.0] * 32  # History for waveform visualization
 
-        # Simplified hexagonal ring definitions: (radius_factor, rotation_speed, thickness)
-        self._hex_rings = [
-            (0.38, 0.6, 2.0),   # inner
-            (0.50, -0.8, 1.8),  # mid
-            (0.62, 0.4, 1.5),   # outer
-            (0.74, -0.5, 1.2),  # far
+        # Orbital arc rings: (radius_factor, deg/sec, thickness, segment_count)
+        self._arc_rings = [
+            (0.36,  22.0, 2.2, 8),
+            (0.49, -28.0, 1.8, 10),
+            (0.62,  18.0, 1.5, 6),
+            (0.76, -14.0, 1.2, 12),
         ]
-        self._hex_angles = [random.uniform(0, 360) for _ in self._hex_rings]
+        self._arc_offsets = [random.uniform(0, 360) for _ in self._arc_rings]
+        self._wave_heights = [3] * 36
+        self._last_step_t = time.perf_counter()
         self._pulses: list[float] = [0.0, 40.0, 80.0]
 
         self._blink      = True
@@ -296,7 +300,7 @@ class HudCanvas(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(20)
 
     def _load_face(self, path: str):
         try:
@@ -315,11 +319,26 @@ class HudCanvas(QWidget):
         except Exception:
             self._face_px = None
 
+    def reset_for_startup_init(self):
+        """Reset arcs for startup sound sync sequence."""
+        self._wake_up_progress = 0.0
+        self._wake_up_active = True
+        self._wake_up_external = True
+        self._arc_offsets = [random.uniform(0, 360) for _ in self._arc_rings]
+        self._pulses = [0.0]
+        self.state = "INITIALISING"
+        self.update()
+
     def set_wake_up_progress(self, progress: float):
-        """Set wake-up progress from MainWindow to sync animations."""
-        self._wake_up_progress = progress
-        if progress >= 1.0:
+        """Drive arc init animation (synced to startup sound)."""
+        self._wake_up_external = True
+        self._wake_up_progress = max(0.0, min(1.0, progress))
+        if self._wake_up_progress >= 1.0:
             self._wake_up_active = False
+            self._wake_up_external = False
+
+    def set_standby_blend(self, blend: float):
+        self._standby_blend = max(0.0, min(1.0, blend))
 
     def update_audio_level(self, level: float, is_input: bool = True):
         """Update audio level for visualization."""
@@ -333,17 +352,30 @@ class HudCanvas(QWidget):
         self._audio_history.append(level)
 
     def _step(self):
+        now_t = time.perf_counter()
+        dt = min(0.05, now_t - self._last_step_t)
+        self._last_step_t = now_t
         self._tick += 1
 
-        # Wake-up animation progress
-        if self._wake_up_active:
+        # Wake-up animation progress (skipped when boot overlay drives it)
+        if self._wake_up_active and not getattr(self, "_wake_up_external", False):
             self._wake_up_progress = min(1.0, self._wake_up_progress + 0.005)
             if self._wake_up_progress >= 1.0:
                 self._wake_up_active = False
 
         # Smooth Color Interpolation (Lerp)
-        is_sleeping = (self.state == "STANDBY")
-        target_hex = "#ffb000" if is_sleeping else (C.MUTED_C if self.muted else C.PRI)
+        is_sleeping = (self.state == "STANDBY") or self._standby_blend > 0.5
+        active_hex = C.MUTED_C if self.muted else C.PRI
+        target_hex = "#ffb000" if is_sleeping else active_hex
+        if 0.01 < self._standby_blend < 0.99:
+            t = self._standby_blend
+            ac = QColor(active_hex)
+            sb = QColor("#ffb000")
+            target_hex = QColor(
+                int(ac.red()   + (sb.red()   - ac.red())   * t),
+                int(ac.green() + (sb.green() - ac.green()) * t),
+                int(ac.blue()  + (sb.blue()  - ac.blue())  * t),
+            ).name()
         target_qcol = QColor(target_hex)
 
         def lerp(c, t):
@@ -375,15 +407,26 @@ class HudCanvas(QWidget):
         self._scale += (self._tgt_scale - self._scale) * sp
         self._halo  += (self._tgt_halo  - self._halo)  * sp
 
-        # Rotate hexagonal rings
-        speak_mult = 3.5 if self.speaking else 1.0
-        sleep_mult = 0.3 if is_sleeping else 1.0
-        for i, (_, rot_spd, _) in enumerate(self._hex_rings):
-            self._hex_angles[i] = (self._hex_angles[i] + rot_spd * speak_mult * sleep_mult) % 360
+        # Rotate orbital arc rings (degrees/sec, frame-rate independent)
+        speak_mult = 2.0 if self.speaking else 1.0
+        sleep_mult = 0.35 if is_sleeping else 1.0
+        init_mult = (0.12 + 0.88 * self._wake_up_progress) if self._wake_up_active else 1.0
+        for i, (_, rot_spd, _, _) in enumerate(self._arc_rings):
+            self._arc_offsets[i] = (
+                self._arc_offsets[i] + rot_spd * speak_mult * sleep_mult * init_mult * dt
+            ) % 360
 
-        self._scan  = (self._scan  + (4.0 if self.speaking else 1.3)) % 360
-        self._scan2 = (self._scan2 + (-3.0 if self.speaking else -0.75)) % 360
-        self._scan3 = (self._scan3 + (2.5 if self.speaking else 0.5)) % 360
+        if self._wake_up_active and self._wake_up_progress < 1.0:
+            fw_i = min(self.width(), self.height())
+            if random.random() < 0.12:
+                self._pulses.append(0.0)
+            lim_i = fw_i * 0.74 * self._wake_up_progress
+            self._pulses = [r + 3.5 for r in self._pulses if r + 3.5 < lim_i]
+
+        scan_rate = 220.0 if self.speaking else 72.0
+        self._scan  = (self._scan  + scan_rate * dt) % 360
+        self._scan2 = (self._scan2 - scan_rate * 0.85 * dt) % 360
+        self._scan3 = (self._scan3 + scan_rate * 0.55 * dt) % 360
 
         fw  = min(self.width(), self.height())
 
@@ -413,6 +456,16 @@ class HudCanvas(QWidget):
         if self._blink_tick >= 38:
             self._blink = not self._blink
             self._blink_tick = 0
+
+        N = 36
+        for i in range(N):
+            if self.muted:
+                self._wave_heights[i] = 2
+            elif self.speaking:
+                self._wave_heights[i] = max(2, min(20, self._wave_heights[i] + random.randint(-4, 5)))
+            else:
+                self._wave_heights[i] = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
+
         self.update()
 
     def paintEvent(self, _):
@@ -432,61 +485,62 @@ class HudCanvas(QWidget):
             c.setAlpha(min(255, max(0, a)))
             return c
 
-        # ─── 1. HEXAGONAL RINGS ───
+        # ─── 1. ORBITAL ARC RINGS (batched paths — 8 draws vs ~100) ───
         p.setBrush(Qt.BrushStyle.NoBrush)
-        for i, (rad_f, _, thick) in enumerate(self._hex_rings):
-            # Wake-up animation: stagger ring appearance and expansion
+        cap = Qt.PenCapStyle.RoundCap
+        for i, (rad_f, _, thick, n_seg) in enumerate(self._arc_rings):
             ring_progress = self._wake_up_progress
             if self._wake_up_active:
-                # Stagger rings: each ring starts at different progress
-                ring_start = i * 0.2
+                ring_start = i * 0.18
                 ring_progress = max(0, min(1, (self._wake_up_progress - ring_start) / (1 - ring_start)))
-                # Expand from center during wake-up
-                expansion_scale = 0.3 + 0.7 * ring_progress
+                expansion_scale = 0.25 + 0.75 * ring_progress
             else:
                 expansion_scale = 1.0
-            
+
             radius = fw * rad_f * self._scale * expansion_scale
-            angle = self._hex_angles[i]
-            
-            # Calculate hexagon vertices
-            hex_pts = []
-            for j in range(6):
-                theta = math.radians(angle + j * 60)
-                x = cx + radius * math.cos(theta)
-                y = cy + radius * math.sin(theta)
-                hex_pts.append(QPointF(x, y))
-            
-            # Draw hexagon with glow
-            glow_a = min(255, int(self._halo * 0.5))
-            if is_sleeping: glow_a = int(glow_a * 0.3)
-            # Fade in during wake-up
+            offset = self._arc_offsets[i]
+            seg_deg = 360.0 / n_seg
+            gap_deg = seg_deg * (0.40 if self.speaking else 0.50)
+            draw_deg = max(2.0, seg_deg - gap_deg)
+
+            glow_a = min(255, int(self._halo * 0.40))
+            core_a = min(255, int(self._halo * 0.90))
+            if is_sleeping:
+                glow_a = int(glow_a * 0.3)
+                core_a = int(core_a * 0.4)
             if self._wake_up_active:
                 glow_a = int(glow_a * ring_progress)
-            
-            # Glow layer
+                core_a = int(core_a * ring_progress)
+
+            if self._wake_up_active and ring_progress < 1.0:
+                vis_segs = max(1, int(n_seg * ring_progress))
+                ring_path = _arc_ring_path(
+                    cx, cy, radius, offset, n_seg, draw_deg, seg_deg, max_seg=vis_segs,
+                )
+            else:
+                ring_path = _arc_ring_path(cx, cy, radius, offset, n_seg, draw_deg, seg_deg)
+
             glow_col = QColor(main_clr)
             glow_col.setAlpha(glow_a)
-            pen_glow = QPen(glow_col, thick + 3)
-            pen_glow.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen_glow)
-            path = QPainterPath()
-            path.moveTo(hex_pts[0])
-            for pt in hex_pts[1:]:
-                path.lineTo(pt)
-            path.closeSubpath()
-            p.drawPath(path)
-            
-            # Core layer
-            core_a = min(255, int(self._halo * 1.0))
-            if is_sleeping: core_a = int(core_a * 0.4)
-            # Fade in during wake-up
-            if self._wake_up_active:
-                core_a = int(core_a * ring_progress)
-            pen_core = QPen(alpha_clr(core_a), thick)
-            pen_core.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            p.setPen(pen_core)
-            p.drawPath(path)
+            p.setPen(QPen(glow_col, thick + 2, Qt.PenStyle.SolidLine, cap))
+            p.drawPath(ring_path)
+
+            p.setPen(QPen(alpha_clr(core_a), thick, Qt.PenStyle.SolidLine, cap))
+            p.drawPath(ring_path)
+
+            if i == len(self._arc_rings) - 1:
+                tick_r = radius - thick * 2
+                tick_path = QPainterPath()
+                for t in range(0, 360, 30):
+                    ta = math.radians(t + offset * 0.4)
+                    x1 = cx + tick_r * math.cos(ta)
+                    y1 = cy + tick_r * math.sin(ta)
+                    x2 = cx + (tick_r - 4) * math.cos(ta)
+                    y2 = cy + (tick_r - 4) * math.sin(ta)
+                    tick_path.moveTo(x1, y1)
+                    tick_path.lineTo(x2, y2)
+                p.setPen(QPen(alpha_clr(int(core_a * 0.35)), 1))
+                p.drawPath(tick_path)
 
         # ─── 2. CROSSHAIR LINES ───
         xh_len = fw * 0.42
@@ -624,6 +678,22 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  self._cur_clr
+        elif self.state == "INITIALISING" or self._wake_up_active:
+            phases = (
+                (0.22, "◈  ARC SYNC · RING 01"),
+                (0.45, "◈  ARC SYNC · RING 02"),
+                (0.68, "◈  ARC SYNC · RING 03"),
+                (0.88, "◈  ARC SYNC · RING 04"),
+                (1.00, "◈  SYNCHRONISED"),
+            )
+            txt = phases[-1][1]
+            for thresh, label in phases:
+                if self._wake_up_progress <= thresh:
+                    txt = label
+                    break
+            sym = "◇" if self._blink else "◈"
+            txt = f"{sym}  {txt}"
+            col = self._cur_clr
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", self._cur_clr
@@ -632,106 +702,80 @@ class HudCanvas(QWidget):
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
 
-        # waveform
+        # waveform (heights precomputed in _step — no random in paint)
         wy = sy + 30
         N, bw = 36, 8
         wx0 = (W - N * bw) / 2
         for i in range(N):
+            hgt = self._wave_heights[i]
             if self.muted:
-                hgt, cl = 2, self._cur_clr
+                cl = self._cur_clr
             elif self.speaking:
-                hgt = random.randint(3, 20)
-                cl  = self._cur_clr if hgt > 12 else alpha_clr(100)
+                cl = self._cur_clr if hgt > 12 else alpha_clr(100)
             else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
-                cl  = alpha_clr(150)
+                cl = alpha_clr(150)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
-class CircularGauge(QWidget):
-    def __init__(self, label: str, color: str = C.PRI, size: int = 70, parent=None):
-        super().__init__(parent)
-        self._label = label
-        self._color = color
-        self._value = 0.0
-        self._text = "--"
-        self._target_value = 0.0
-        self._size = size
-        self.setFixedSize(size, size + 20)
-        self._anim_timer = QTimer(self)
-        self._anim_timer.timeout.connect(self._animate)
-        self._anim_timer.start(30)
+def _arc_ring_path(
+    cx: float, cy: float, radius: float,
+    offset_deg: float, n_seg: int, draw_deg: float, seg_deg: float,
+    max_seg: int | None = None,
+) -> QPainterPath:
+    """Single path for all arc segments on one ring — one draw call instead of dozens."""
+    path = QPainterPath()
+    rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
+    count = n_seg if max_seg is None else min(n_seg, max(0, max_seg))
+    for s in range(count):
+        start = offset_deg + s * seg_deg
+        seg = QPainterPath()
+        seg.arcMoveTo(rect, start)
+        seg.arcTo(rect, start, -draw_deg)
+        path.addPath(seg)
+    return path
 
-    def set_color(self, color: str):
-        self._color = color
-        self.update()
 
-    def set_value(self, pct: float, text: str):
-        self._target_value = max(0.0, min(100.0, pct))
-        self._text = text
-
-    def _animate(self):
-        if abs(self._value - self._target_value) > 0.5:
-            self._value += (self._target_value - self._value) * 0.15
-            self.update()
+def _hex_path(cx: float, cy: float, radius: float, rotation: float = -90) -> QPainterPath:
+    path = QPainterPath()
+    for i in range(6):
+        theta = math.radians(rotation + i * 60)
+        pt = QPointF(cx + radius * math.cos(theta), cy + radius * math.sin(theta))
+        if i == 0:
+            path.moveTo(pt)
         else:
-            self._value = self._target_value
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        W, H = self.width(), self.height()
-        cx, cy = W / 2, (H - 20) / 2
-        radius = (W - 12) / 2
-
-        # Determine color based on value
-        if self._value > 85:
-            bar_col = qcol(C.RED)
-        elif self._value > 65:
-            bar_col = qcol(C.ACC)
-        else:
-            bar_col = qcol(self._color)
-
-        # Background ring
-        p.setPen(QPen(qcol(C.BORDER, 80), 3))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), radius, radius)
-
-        # Progress arc
-        start_angle = 135 * 16
-        span_angle = int((self._value / 100) * 270 * 16)
-        
-        # Glow effect
-        glow_col = QColor(bar_col)
-        glow_col.setAlpha(60)
-        p.setPen(QPen(glow_col, 5))
-        p.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2), start_angle, span_angle)
-        
-        # Main arc
-        p.setPen(QPen(bar_col, 3))
-        p.drawArc(QRectF(cx - radius, cy - radius, radius * 2, radius * 2), start_angle, span_angle)
-
-        # Center value
-        p.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(0, cy - 8, W, 16), Qt.AlignmentFlag.AlignCenter, self._text)
-
-        # Label
-        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
-        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(0, H - 18, W, 14), Qt.AlignmentFlag.AlignCenter, self._label)
+            path.lineTo(pt)
+    path.closeSubpath()
+    return path
 
 
-class SystemStatusCard(QWidget):
+def _chamfer_rect(x: float, y: float, w: float, h: float, cut: float = 6) -> QPainterPath:
+    path = QPainterPath()
+    path.moveTo(x + cut, y)
+    path.lineTo(x + w - cut, y)
+    path.lineTo(x + w, y + cut)
+    path.lineTo(x + w, y + h - cut)
+    path.lineTo(x + w - cut, y + h)
+    path.lineTo(x + cut, y + h)
+    path.lineTo(x, y + h - cut)
+    path.lineTo(x, y + cut)
+    path.closeSubpath()
+    return path
+
+
+class LeftPanelRail(QWidget):
+    """Custom-painted tactical rail background for the left panel."""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pulse_phase = 0.0
-        self._anim_timer = QTimer(self)
-        self._anim_timer.timeout.connect(self._animate)
-        self._anim_timer.start(50)
-        self.setFixedHeight(85)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self._phase = 0.0
+        self._scan_y = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(40)
 
-    def _animate(self):
-        self._pulse_phase = (self._pulse_phase + 0.08) % (2 * math.pi)
+    def _tick(self):
+        self._phase = (self._phase + 0.06) % (2 * math.pi)
+        self._scan_y = (self._scan_y + 1.2) % max(self.height(), 1)
         self.update()
 
     def paintEvent(self, _):
@@ -739,63 +783,203 @@ class SystemStatusCard(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
 
-        # Background with gradient
-        grad = QLinearGradient(0, 0, W, H)
-        grad.setColorAt(0, qcol("#010810"))
-        grad.setColorAt(1, qcol("#011018"))
-        p.setBrush(QBrush(grad))
-        p.setPen(QPen(qcol(C.BORDER, 100), 1))
-        p.drawRoundedRect(QRectF(2, 2, W - 4, H - 4), 4, 4)
+        grad = QLinearGradient(0, 0, W, 0)
+        grad.setColorAt(0.0, qcol("#000408"))
+        grad.setColorAt(0.12, qcol("#000c14"))
+        grad.setColorAt(1.0, qcol(C.DARK))
+        p.fillRect(self.rect(), QBrush(grad))
 
-        # Animated pulse indicator
-        pulse_alpha = int(100 + 80 * math.sin(self._pulse_phase))
-        pulse_col = QColor(C.PRI)
-        pulse_col.setAlpha(pulse_alpha)
-        
-        cx, cy = 18, H / 2
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(pulse_col))
-        p.drawEllipse(QPointF(cx, cy), 6, 6)
+        spine_x = 10.0
+        pulse = 0.55 + 0.45 * math.sin(self._phase)
+        spine_grad = QLinearGradient(spine_x, 0, spine_x, H)
+        spine_grad.setColorAt(0.0, qcol(C.PRI, 0))
+        spine_grad.setColorAt(0.15, qcol(C.PRI, int(90 * pulse)))
+        spine_grad.setColorAt(0.5, qcol(C.PRI, int(180 * pulse)))
+        spine_grad.setColorAt(0.85, qcol(C.PRI, int(90 * pulse)))
+        spine_grad.setColorAt(1.0, qcol(C.PRI, 0))
+        p.setPen(QPen(QBrush(spine_grad), 2))
+        p.drawLine(QPointF(spine_x, 8), QPointF(spine_x, H - 8))
 
-        # Outer glow ring
-        glow_radius = 10 + 3 * math.sin(self._pulse_phase)
-        glow_col = QColor(C.PRI)
-        glow_col.setAlpha(40)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(glow_col, 1.5))
-        p.drawEllipse(QPointF(cx, cy), glow_radius, glow_radius)
+        for y in range(18, H - 12, 14):
+            tick_a = 50 + int(30 * math.sin(self._phase + y * 0.08))
+            p.setPen(QPen(qcol(C.PRI_DIM, tick_a), 1))
+            p.drawLine(QPointF(spine_x - 3, y), QPointF(spine_x + 3, y))
 
-        # Status text
-        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        p.setPen(QPen(qcol(C.GREEN), 1))
-        p.drawText(QRectF(32, 8, W - 36, 16), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SYSTEM ONLINE")
+        p.setPen(QPen(qcol(C.BORDER, 35), 1))
+        for gx in range(24, W, 18):
+            p.drawLine(QPointF(gx, 0), QPointF(gx, H))
+        for gy in range(0, H, 18):
+            p.drawLine(QPointF(18, gy), QPointF(W, gy))
 
-        p.setFont(QFont("Consolas", 7))
-        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(32, 24, W - 36, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "All protocols nominal")
+        scan_a = int(35 + 25 * math.sin(self._phase * 2))
+        p.setPen(QPen(qcol(C.PRI, scan_a), 1))
+        p.drawLine(QPointF(16, self._scan_y), QPointF(W - 4, self._scan_y))
 
-        # Decorative lines
-        p.setPen(QPen(qcol(C.BORDER, 60), 1))
-        p.drawLine(QPointF(32, 42), QPointF(W - 8, 42))
-        
-        # Animated data stream
+        p.setPen(QPen(qcol(C.BORDER_B, 120), 1))
+        for sx, sy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+            ox = 4 if sx < 0 else W - 14
+            oy = 4 if sy < 0 else H - 14
+            p.drawLine(QPointF(ox, oy), QPointF(ox + 8 * sx, oy))
+            p.drawLine(QPointF(ox, oy), QPointF(ox, oy + 8 * sy))
+
+        p.setPen(QPen(qcol(C.BORDER, 180), 1))
+        p.drawLine(QPointF(W - 1, 0), QPointF(W - 1, H))
+
+
+class LinkStatusStrip(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(45)
+        self.setFixedHeight(46)
+
+    def _tick(self):
+        self._phase = (self._phase + 0.1) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rect = QRectF(4, 3, W - 8, H - 6)
+
+        p.setBrush(QBrush(qcol("#000a12", 200)))
+        p.setPen(QPen(qcol(C.BORDER, 90), 1))
+        p.drawPath(_chamfer_rect(rect.x(), rect.y(), rect.width(), rect.height(), 5))
+
+        pulse = int(120 + 80 * math.sin(self._phase))
+        p.setPen(QPen(qcol(C.GREEN, pulse), 1.5))
+        chev_x = 12 + (self._phase * 6) % 10
         for i in range(3):
-            x = 32 + (self._pulse_phase * 20 + i * 30) % (W - 48)
-            y = 52 + 4 * math.sin(self._pulse_phase + i)
-            p.setPen(QPen(qcol(C.PRI_DIM), 1))
-            p.drawPoint(QPointF(x, y))
+            x = chev_x + i * 7
+            p.drawLine(QPointF(x, H / 2 - 4), QPointF(x + 4, H / 2))
+            p.drawLine(QPointF(x + 4, H / 2), QPointF(x, H / 2 + 4))
+
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.GREEN), 1))
+        p.drawText(QRectF(34, 8, W - 38, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "UPLINK // NOMINAL")
+
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        code = f"0x{int((self._phase * 40) % 256):02X} · SYNC LOCK"
+        p.drawText(QRectF(34, 24, W - 38, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, code)
+
+        p.setPen(QPen(qcol(C.BORDER, 70), 1))
+        p.drawLine(QPointF(34, H - 10), QPointF(W - 10, H - 10))
+        stream_x = 34 + (self._phase * 18) % (W - 50)
+        p.setPen(QPen(qcol(C.PRI_DIM, 180), 1))
+        p.drawPoint(QPointF(stream_x, H - 10))
 
 
-class MetricBar(QWidget):
+class HexMetricCell(QWidget):
+    """Hexagonal perimeter gauge — matches the HUD core aesthetic."""
 
     def __init__(self, label: str, color: str = C.PRI, parent=None):
         super().__init__(parent)
         self._label = label
         self._color = color
         self._value = 0.0
-        self._text  = "--"
-        self.setFixedHeight(32)
-        self.setMinimumWidth(80)
+        self._target = 0.0
+        self._text = "--"
+        self.setFixedHeight(54)
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._animate)
+        self._tmr.start(30)
+
+    def set_color(self, color: str):
+        self._color = color
+        self.update()
+
+    def set_value(self, pct: float, text: str):
+        self._target = max(0.0, min(100.0, pct))
+        self._text = text
+
+    def _animate(self):
+        if abs(self._value - self._target) > 0.4:
+            self._value += (self._target - self._value) * 0.18
+            self.update()
+        else:
+            self._value = self._target
+
+    def _bar_color(self) -> QColor:
+        if self._value > 85:
+            return qcol(C.RED)
+        if self._value > 65:
+            return qcol(C.ACC)
+        return qcol(self._color)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        cx, cy = W * 0.36, H / 2
+        radius = min(W * 0.28, H * 0.38)
+        bar_col = self._bar_color()
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(4, 4, 28, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label)
+
+        p.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(W - 58, 6, 54, 16),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
+
+        track = _hex_path(cx, cy, radius)
+        p.setPen(QPen(qcol(C.BORDER, 70), 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(track)
+
+        filled_edges = int((self._value / 100.0) * 6 + 0.001)
+        partial = ((self._value / 100.0) * 6) % 1.0
+        rot = -90
+        for edge in range(filled_edges + (1 if partial > 0.01 and filled_edges < 6 else 0)):
+            i = edge % 6
+            t0 = math.radians(rot + i * 60)
+            t1 = math.radians(rot + (i + 1) * 60)
+            p0 = QPointF(cx + radius * math.cos(t0), cy + radius * math.sin(t0))
+            p1 = QPointF(cx + radius * math.cos(t1), cy + radius * math.sin(t1))
+            if edge < filled_edges:
+                frac = 1.0
+            else:
+                frac = partial
+            mid = QPointF(p0.x() + (p1.x() - p0.x()) * frac, p0.y() + (p1.y() - p0.y()) * frac)
+            glow = QColor(bar_col)
+            glow.setAlpha(50)
+            p.setPen(QPen(glow, 4))
+            p.drawLine(p0, mid)
+            p.setPen(QPen(bar_col, 2))
+            p.drawLine(p0, mid)
+
+        inner_r = radius * 0.55
+        p.setBrush(QBrush(qcol("#000c14", 220)))
+        p.setPen(QPen(qcol(C.BORDER, 50), 1))
+        p.drawPath(_hex_path(cx, cy, inner_r))
+
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.setPen(QPen(bar_col, 1))
+        pct_txt = f"{self._value:.0f}" if self._text != "--" else "--"
+        p.drawText(QRectF(cx - inner_r, cy - 8, inner_r * 2, 16),
+                   Qt.AlignmentFlag.AlignCenter, pct_txt)
+
+        p.setPen(QPen(qcol(C.BORDER, 50), 1))
+        p.drawLine(QPointF(4, H - 3), QPointF(W - 4, H - 3))
+
+
+class SegmentTelemetryBar(QWidget):
+    def __init__(self, label: str, color: str = C.PRI, segments: int = 10, parent=None):
+        super().__init__(parent)
+        self._label = label
+        self._color = color
+        self._segments = segments
+        self._value = 0.0
+        self._text = "--"
+        self.setFixedHeight(38)
 
     def set_color(self, color: str):
         self._color = color
@@ -803,7 +987,381 @@ class MetricBar(QWidget):
 
     def set_value(self, pct: float, text: str):
         self._value = max(0.0, min(100.0, pct))
-        self._text  = text
+        self._text = text
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        bar_col = qcol(self._color)
+        if self._value > 85:
+            bar_col = qcol(C.RED)
+        elif self._value > 65:
+            bar_col = qcol(C.ACC)
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(6, 2, 30, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label)
+
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(W - 62, 2, 56, 12),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
+
+        seg_area = QRectF(8, 18, W - 16, 12)
+        gap = 2
+        seg_w = (seg_area.width() - gap * (self._segments - 1)) / self._segments
+        lit = int((self._value / 100.0) * self._segments + 0.001)
+
+        for i in range(self._segments):
+            x = seg_area.x() + i * (seg_w + gap)
+            seg_rect = _chamfer_rect(x, seg_area.y(), seg_w, seg_area.height(), 2)
+            if i < lit:
+                glow = QColor(bar_col)
+                glow.setAlpha(35)
+                p.setBrush(QBrush(glow))
+                p.setPen(QPen(bar_col, 1))
+            else:
+                p.setBrush(QBrush(qcol("#010c12")))
+                p.setPen(QPen(qcol(C.BORDER, 45), 1))
+            p.drawPath(seg_rect)
+
+
+class TelemetryReadout(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lines: list[tuple[str, str]] = []
+        self.setFixedHeight(58)
+
+    def set_line(self, index: int, key: str, value: str, color: str = C.TEXT_MED):
+        while len(self._lines) <= index:
+            self._lines.append(("", "", C.TEXT_MED))
+        self._lines[index] = (key, value, color)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rect = QRectF(4, 2, W - 8, H - 4)
+        p.setBrush(QBrush(qcol("#000810", 210)))
+        p.setPen(QPen(qcol(C.BORDER, 80), 1))
+        p.drawPath(_chamfer_rect(rect.x(), rect.y(), rect.width(), rect.height(), 4))
+
+        y = 10
+        for key, val, col in self._lines:
+            p.setFont(QFont("Consolas", 6))
+            p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+            p.drawText(QRectF(10, y, 36, 12),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, key)
+            p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+            p.setPen(QPen(qcol(col), 1))
+            p.drawText(QRectF(46, y, W - 54, 12),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, val)
+            y += 14
+
+
+class StatusLedColumn(QWidget):
+    def __init__(self, items: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self._items = [(label, color) for label, color in items]
+        self._phase = 0.0
+        self._colors = [color for _, color in items]
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(60)
+        self.setFixedHeight(22 * len(items) + 8)
+
+    def set_colors(self, colors: list[str]):
+        self._colors = colors
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.12) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rail_x = 14.0
+
+        p.setPen(QPen(qcol(C.BORDER, 60), 1))
+        p.drawLine(QPointF(rail_x, 6), QPointF(rail_x, H - 6))
+
+        row_h = 22
+        for i, (label, _) in enumerate(self._items):
+            y = 10 + i * row_h
+            col = qcol(self._colors[i] if i < len(self._colors) else C.TEXT_DIM)
+            pulse = 0.7 + 0.3 * math.sin(self._phase + i * 0.8)
+            glow = QColor(col)
+            glow.setAlpha(int(50 * pulse))
+            p.setBrush(QBrush(glow))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(rail_x, y), 7, 7)
+            p.setBrush(QBrush(col))
+            p.drawEllipse(QPointF(rail_x, y), 4, 4)
+
+            p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+            p.setPen(QPen(col, 1))
+            p.drawText(QRectF(26, y - 7, W - 30, 14),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
+
+            if i < len(self._items) - 1:
+                p.setPen(QPen(qcol(C.BORDER, 40), 1))
+                p.drawLine(QPointF(rail_x, y + 8), QPointF(rail_x, y + row_h - 8))
+
+
+class OrbitalCommandStrip(QWidget):
+    """Asymmetric command strip — no legacy badge / dotted title layout."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.setFixedHeight(54)
+        self._phase = 0.0
+        self._accent = C.PRI
+        self._blend = 0.0
+        self._time_str = "00:00:00"
+        self._date_str = ""
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(40)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def set_blend(self, blend: float):
+        self._blend = max(0.0, min(1.0, blend))
+        self.update()
+
+    def set_clock(self, time_str: str, date_str: str):
+        self._time_str = time_str
+        self._date_str = date_str
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.08) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        accent = QColor(self._accent)
+        if self._blend > 0.01:
+            standby = QColor(C.STANDBY_C)
+            accent = QColor(
+                int(accent.red()   + (standby.red()   - accent.red())   * self._blend),
+                int(accent.green() + (standby.green() - accent.green()) * self._blend),
+                int(accent.blue()  + (standby.blue()  - accent.blue())  * self._blend),
+            )
+
+        p.fillRect(self.rect(), qcol("#000408"))
+
+        rail_w = 148
+        rail = QLinearGradient(0, 0, rail_w, 0)
+        rail.setColorAt(0.0, qcol("#001018"))
+        rail.setColorAt(1.0, qcol("#000408", 0))
+        p.fillRect(QRectF(0, 0, rail_w, H), QBrush(rail))
+
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 200), 2))
+        p.drawLine(QPointF(0, H - 1), QPointF(W, H - 1))
+        for i in range(0, int(W), 14):
+            h = 4 if i % 28 == 0 else 2
+            p.drawLine(QPointF(i, H - 1), QPointF(i, H - 1 - h))
+
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 90), 1))
+        p.drawLine(QPointF(18, 6), QPointF(18, H - 8))
+        for y in range(12, H - 10, 9):
+            w = 6 + int(4 * math.sin(self._phase + y * 0.1))
+            p.drawLine(QPointF(18 - w, y), QPointF(18 + w, y))
+
+        p.setFont(QFont("Consolas", 5, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(28, 10, 100, 10),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "SESSION // ACTIVE")
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.setPen(QPen(accent, 1))
+        p.drawText(QRectF(28, 22, 110, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "MARK-39 CORE")
+
+        tick = int((self._phase * 30) % 999)
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_MED), 1))
+        p.drawText(QRectF(28, 36, 110, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"SYNC {tick:03d} · SECURE")
+
+        cx = W * 0.46
+        wing = 120
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 60), 1))
+        p.drawLine(QPointF(cx - wing, 16), QPointF(cx - 40, 16))
+        p.drawLine(QPointF(cx + 40, 16), QPointF(cx + wing, 16))
+        p.drawLine(QPointF(cx - wing, H - 14), QPointF(cx - 50, H - 14))
+        p.drawLine(QPointF(cx + 50, H - 14), QPointF(cx + wing, H - 14))
+
+        p.setFont(QFont("Consolas", 22, QFont.Weight.Bold))
+        p.setPen(QPen(accent, 1))
+        title = "JARVIS"
+        tw = p.fontMetrics().horizontalAdvance(title)
+        p.drawText(QRectF(cx - tw / 2, 10, tw, 30), Qt.AlignmentFlag.AlignCenter, title)
+
+        beam_y = 42
+        beam_w = 90
+        bx = cx - beam_w / 2 + (self._phase * 18) % (beam_w - 20)
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 180), 2))
+        p.drawLine(QPointF(cx - beam_w / 2, beam_y), QPointF(bx, beam_y))
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 80), 1))
+        p.drawLine(QPointF(bx + 20, beam_y), QPointF(cx + beam_w / 2, beam_y))
+
+        rx = W - 20
+        box_w, box_h = 22, 26
+        bx0 = rx - box_w * 4 - 18
+        by0 = (H - box_h) / 2
+        digits = self._time_str.replace(":", "")
+        for i, d in enumerate(digits[:6]):
+            x = bx0 + i * (box_w + 3)
+            p.setBrush(QBrush(qcol("#000c14")))
+            p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 100), 1))
+            p.drawPath(_chamfer_rect(x, by0, box_w, box_h, 3))
+            p.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+            p.setPen(QPen(accent, 1))
+            p.drawText(QRectF(x, by0, box_w, box_h), Qt.AlignmentFlag.AlignCenter, d)
+
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(bx0, H - 12, box_w * 4 + 18, 10),
+                   Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._date_str)
+
+        sweep = (self._phase * 50) % W
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 35), 1))
+        p.drawLine(QPointF(sweep, 0), QPointF(sweep - 40, H))
+
+
+class StateTransitionOverlay(QWidget):
+    """Full-window sweep when switching active ↔ standby."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+        self._progress = 0.0
+        self._to_standby = False
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._step)
+
+    def play(self, to_standby: bool, on_tick=None, on_done=None):
+        self._to_standby = to_standby
+        self._progress = 0.0
+        self._on_tick = on_tick
+        self._on_done = on_done
+        self.show()
+        self.raise_()
+        self._tmr.start(16)
+
+    def _step(self):
+        self._progress = min(1.0, self._progress + 0.045)
+        if self._on_tick:
+            self._on_tick(self._progress, self._to_standby)
+        self.update()
+        if self._progress >= 1.0:
+            self._tmr.stop()
+            self.hide()
+            if self._on_done:
+                self._on_done()
+
+    def paintEvent(self, _):
+        if self._progress <= 0:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        col = C.STANDBY_C if self._to_standby else C.PRI
+        alpha = int(55 * math.sin(self._progress * math.pi))
+        p.fillRect(self.rect(), qcol(col, alpha))
+        y = int(H * self._progress)
+        grad = QLinearGradient(0, y - 40, 0, y + 40)
+        grad.setColorAt(0.0, qcol(col, 0))
+        grad.setColorAt(0.5, qcol(col, 140))
+        grad.setColorAt(1.0, qcol(col, 0))
+        p.fillRect(QRectF(0, y - 40, W, 80), QBrush(grad))
+        p.setPen(QPen(qcol(col, 200), 2))
+        p.drawLine(QPointF(0, y), QPointF(W, y))
+
+
+class SysTerminalHeader(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self._accent = C.ACC2
+        self._line = 0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(55)
+        self.setFixedHeight(38)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.12) % (2 * math.pi)
+        self._line = (self._line + 1) % 999
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rect = QRectF(4, 2, W - 8, H - 4)
+
+        p.setBrush(QBrush(qcol("#000a0c", 220)))
+        p.setPen(QPen(qcol(self._accent, 90), 1))
+        p.drawPath(_chamfer_rect(rect.x(), rect.y(), rect.width(), rect.height(), 5))
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(self._accent), 1))
+        p.drawText(QRectF(10, 6, W - 20, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "CORE TERMINAL // SYS STREAM")
+
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(10, 20, W - 20, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"LN {self._line:04d} · DAEMON OUTPUT")
+
+        bx = W - 54
+        for i in range(6):
+            h = 2 + abs(math.sin(self._phase + i * 0.8)) * 7
+            p.setPen(QPen(qcol(self._accent, 130), 1.5))
+            p.drawLine(QPointF(bx + i * 4, H / 2 - h / 2), QPointF(bx + i * 4, H / 2 + h / 2))
+
+
+class RightPanelRail(QWidget):
+    """Mirrored tactical rail for the command / comms side."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self._phase = 0.0
+        self._scan_y = 0.0
+        self._accent = C.PRI
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(40)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.055) % (2 * math.pi)
+        self._scan_y = (self._scan_y + 1.0) % max(self.height(), 1)
         self.update()
 
     def paintEvent(self, _):
@@ -811,54 +1369,631 @@ class MetricBar(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
 
-        # Background
-        p.setBrush(QBrush(qcol("#010a10")))
-        p.setPen(QPen(qcol(C.BORDER, 60), 1))
-        p.drawRect(QRectF(0, 0, W, H))
+        grad = QLinearGradient(W, 0, 0, 0)
+        grad.setColorAt(0.0, qcol("#000408"))
+        grad.setColorAt(0.12, qcol("#000c14"))
+        grad.setColorAt(1.0, qcol(C.DARK))
+        p.fillRect(self.rect(), QBrush(grad))
 
-        # Bar track
-        bar_h   = 3
-        bar_y   = H - bar_h - 4
-        bar_w   = W - 10
-        bar_x   = 5
-        fill_w  = int(bar_w * self._value / 100)
+        spine_x = W - 11.0
+        pulse = 0.55 + 0.45 * math.sin(self._phase)
+        spine_grad = QLinearGradient(spine_x, 0, spine_x, H)
+        spine_grad.setColorAt(0.0, qcol(self._accent, 0))
+        spine_grad.setColorAt(0.2, qcol(self._accent, int(80 * pulse)))
+        spine_grad.setColorAt(0.5, qcol(self._accent, int(170 * pulse)))
+        spine_grad.setColorAt(0.8, qcol(self._accent, int(80 * pulse)))
+        spine_grad.setColorAt(1.0, qcol(self._accent, 0))
+        p.setPen(QPen(QBrush(spine_grad), 2))
+        p.drawLine(QPointF(spine_x, 8), QPointF(spine_x, H - 8))
 
-        p.setBrush(QBrush(qcol(C.BAR_BG)))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.drawRect(QRectF(bar_x, bar_y, bar_w, bar_h))
+        for y in range(22, H - 14, 16):
+            tick_a = 45 + int(35 * math.sin(self._phase + y * 0.07))
+            p.setPen(QPen(qcol(self._accent, tick_a), 1))
+            p.drawLine(QPointF(spine_x - 3, y), QPointF(spine_x + 3, y))
 
-        if self._value > 85:
-            bar_col = qcol(C.RED)
-        elif self._value > 65:
-            bar_col = qcol(C.ACC)
-        else:
-            bar_col = qcol(self._color)
+        p.setPen(QPen(qcol(C.BORDER, 28), 1))
+        for gx in range(0, W - 20, 16):
+            p.drawLine(QPointF(gx, 0), QPointF(gx, H))
+        for gy in range(0, H, 16):
+            p.drawLine(QPointF(0, gy), QPointF(W - 18, gy))
 
-        if fill_w > 0:
-            # Glow effect on bar
-            glow_col = QColor(bar_col); glow_col.setAlpha(40)
-            p.setBrush(QBrush(glow_col))
-            p.drawRect(QRectF(bar_x, bar_y - 2, fill_w, bar_h + 4))
-            p.setBrush(QBrush(bar_col))
-            p.drawRect(QRectF(bar_x, bar_y, fill_w, bar_h))
+        scan_a = int(30 + 20 * math.sin(self._phase * 2.2))
+        p.setPen(QPen(qcol(self._accent, scan_a), 1))
+        p.drawLine(QPointF(4, self._scan_y), QPointF(W - 20, self._scan_y))
 
-        # Label (left)
-        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.BORDER_B, 110), 1))
+        p.drawLine(QPointF(0, 0), QPointF(0, H))
+        for sx, sy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+            ox = 4 if sx < 0 else W - 14
+            oy = 4 if sy < 0 else H - 14
+            p.drawLine(QPointF(ox, oy), QPointF(ox + 9 * sx, oy))
+            p.drawLine(QPointF(ox, oy), QPointF(ox, oy + 9 * sy))
+
+
+class NeuralLinkHeader(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._phase = 0.0
+        self._accent = C.PRI
+        self._packet = 0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(50)
+        self.setFixedHeight(40)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.14) % (2 * math.pi)
+        if random.random() < 0.15:
+            self._packet = (self._packet + random.randint(1, 9)) % 9999
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        rect = QRectF(4, 2, W - 8, H - 4)
+
+        p.setBrush(QBrush(qcol("#000a10", 215)))
+        p.setPen(QPen(qcol(self._accent, 100), 1))
+        p.drawPath(_chamfer_rect(rect.x(), rect.y(), rect.width(), rect.height(), 6))
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(self._accent), 1))
+        p.drawText(QRectF(10, 6, W - 20, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   "NEURAL LINK // COMMS")
+
+        p.setFont(QFont("Consolas", 6))
         p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(6, 3, 40, 14), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._label)
+        p.drawText(QRectF(10, 20, W - 70, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   f"PKT {self._packet:04d} · ENCRYPTED")
 
-        # Value (right)
-        p.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(0, 3, W - 6, 14), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
+        wave_x = W - 58
+        wave_y = H / 2 + 1
+        for i in range(8):
+            h = 3 + abs(math.sin(self._phase + i * 0.7)) * 8
+            col = qcol(self._accent, int(120 + 80 * math.sin(self._phase + i)))
+            p.setPen(QPen(col, 2))
+            p.drawLine(QPointF(wave_x + i * 5, wave_y - h / 2),
+                       QPointF(wave_x + i * 5, wave_y + h / 2))
+
+
+class CommsViewport(QWidget):
+    """Framed comms terminal — log sits inside a painted HUD shell."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._accent = C.PRI
+        self._phase = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(55)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 14, 16, 12)
+        lay.setSpacing(0)
+        self.log = LogWidget(realtime=True)
+        self.log.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                border: none;
+                padding: 8px 10px;
+                line-height: 1.45;
+                selection-background-color: #001f2e;
+            }
+            QScrollBar:vertical { width: 0px; background: transparent; }
+            QScrollBar::handle:vertical { background: transparent; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+        self.log.setFont(QFont("Consolas", 9))
+        lay.addWidget(self.log)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 0.09) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        outer = QRectF(3, 2, W - 6, H - 4)
+        inner = QRectF(8, 8, W - 16, H - 16)
+
+        p.setBrush(QBrush(qcol("#00060c", 230)))
+        p.setPen(QPen(qcol(self._accent, 90), 1))
+        p.drawPath(_chamfer_rect(outer.x(), outer.y(), outer.width(), outer.height(), 8))
+
+        p.setPen(QPen(qcol(C.BORDER, 50), 1))
+        p.drawPath(_chamfer_rect(inner.x(), inner.y(), inner.width(), inner.height(), 5))
+
+        for i in range(5):
+            y = inner.y() + 6 + i * ((inner.height() - 12) / 4)
+            dash_x = inner.x() + 4 + (self._phase * 12 + i * 18) % (inner.width() - 12)
+            p.setPen(QPen(qcol(self._accent, 35), 1))
+            p.drawPoint(QPointF(dash_x, y))
+
+        p.setPen(QPen(qcol(self._accent, 160), 1.5))
+        for corner, ox, oy in [("tl", inner.left(), inner.top()),
+                               ("tr", inner.right(), inner.top()),
+                               ("bl", inner.left(), inner.bottom()),
+                               ("br", inner.right(), inner.bottom())]:
+            dx = 1 if "l" in corner else -1
+            dy = 1 if "t" in corner else -1
+            p.drawLine(QPointF(ox, oy), QPointF(ox + 10 * dx, oy))
+            p.drawLine(QPointF(ox, oy), QPointF(ox, oy + 10 * dy))
+
+        stream_y = inner.bottom() - 4
+        stream_x = inner.x() + 6 + (self._phase * 22) % (inner.width() - 14)
+        p.setPen(QPen(qcol(self._accent, 120), 1))
+        p.drawLine(QPointF(stream_x, stream_y), QPointF(stream_x + 8, stream_y))
+
+
+class SectionTag(QWidget):
+    def __init__(self, text: str, accent: str = C.ACC, parent=None):
+        super().__init__(parent)
+        self._text = text
+        self._accent = accent
+        self.setFixedHeight(18)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W = self.width()
+        p.setPen(QPen(qcol(self._accent), 1))
+        p.drawLine(QPointF(6, 14), QPointF(18, 14))
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.drawText(QRectF(22, 2, W - 24, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._text)
+        p.setPen(QPen(qcol(C.BORDER, 60), 1))
+        p.drawLine(QPointF(22, 15), QPointF(W - 6, 15))
+
+
+class DataVaultPort(QWidget):
+    file_selected = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(92)
+        self._current_file: str | None = None
+        self._hovering = False
+        self._drag_over = False
+        self._accent = C.ACC
+        self._rotation = 0.0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._animate)
+        self._tmr.start(35)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self._canvas = _VaultCanvas(self)
+        lay.addWidget(self._canvas)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self._canvas.update()
+
+    def _animate(self):
+        self._rotation = (self._rotation + (1.8 if self._drag_over else 0.6)) % 360
+        self._canvas.update()
+
+    def dragEnterEvent(self, e: QDragEnterEvent):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+            self._drag_over = True
+            self._canvas.update()
+
+    def dragLeaveEvent(self, e):
+        self._drag_over = False
+        self._canvas.update()
+
+    def dropEvent(self, e: QDropEvent):
+        self._drag_over = False
+        urls = e.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if Path(path).is_file():
+                self._set_file(path)
+        self._canvas.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._browse()
+
+    def enterEvent(self, e):
+        self._hovering = True
+        self._canvas.update()
+
+    def leaveEvent(self, e):
+        self._hovering = False
+        self._canvas.update()
+
+    def current_file(self) -> str | None:
+        return self._current_file
+
+    def clear_file(self):
+        self._current_file = None
+        self._canvas.update()
+
+    def _browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a file for JARVIS", str(Path.home()),
+            "All Files (*.*);;"
+            "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
+            "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
+            "Data (*.csv *.xlsx *.json *.xml);;"
+            "Code (*.py *.js *.ts *.html *.css *.java *.cpp *.go);;"
+            "Audio (*.mp3 *.wav *.ogg *.m4a *.aac *.flac);;"
+            "Video (*.mp4 *.avi *.mov *.mkv *.wmv *.webm);;"
+            "Archives (*.zip *.rar *.tar *.gz *.7z)",
+        )
+        if path:
+            self._set_file(path)
+
+    def _set_file(self, path: str):
+        self._current_file = path
+        self._canvas.update()
+        self.file_selected.emit(path)
+
+
+class _VaultCanvas(QWidget):
+    def __init__(self, port: DataVaultPort):
+        super().__init__(port)
+        self._p = port
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        z = self._p
+        W, H = self.width(), self.height()
+        cx, cy = W * 0.28, H / 2
+        accent = z._accent
+        portal_r = min(H * 0.38, 34)
+
+        bg = QRectF(4, 4, W - 8, H - 8)
+        p.setBrush(QBrush(qcol("#000810", 220)))
+        p.setPen(QPen(qcol(accent, 70 if not z._drag_over else 140), 1))
+        p.drawPath(_chamfer_rect(bg.x(), bg.y(), bg.width(), bg.height(), 5))
+
+        outer = _hex_path(cx, cy, portal_r + 6, z._rotation)
+        inner = _hex_path(cx, cy, portal_r - 4, -z._rotation * 0.6)
+        ring_col = qcol(accent, 200 if z._drag_over else (120 if z._hovering else 70))
+        p.setPen(QPen(ring_col, 1.5))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(outer)
+        p.setPen(QPen(qcol(accent, 50), 1))
+        p.drawPath(inner)
+
+        if z._current_file:
+            self._paint_loaded(p, W, H, cx, cy, portal_r)
+        elif z._drag_over:
+            self._paint_ingest(p, W, H, cx, cy, portal_r, accent)
+        else:
+            self._paint_idle(p, W, H, cx, cy, portal_r, accent)
+
+    def _paint_idle(self, p, W, H, cx, cy, r, accent):
+        p.setBrush(QBrush(qcol(accent, 25)))
+        p.setPen(QPen(qcol(accent, 100), 1))
+        p.drawPath(_hex_path(cx, cy, r * 0.55))
+        p.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(accent), 1))
+        p.drawText(QRectF(cx - r, cy - 10, r * 2, 20), Qt.AlignmentFlag.AlignCenter, "◇")
+        tx = cx + r + 14
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.drawText(QRectF(tx, cy - 18, W - tx - 8, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "INJECT PAYLOAD")
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(tx, cy - 2, W - tx - 8, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "DROP · CLICK · SCAN")
+
+    def _paint_ingest(self, p, W, H, cx, cy, r, accent):
+        for i in range(3):
+            rr = r + 8 + i * 7
+            a = int(90 - i * 25)
+            p.setPen(QPen(qcol(accent, a), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(_hex_path(cx, cy, rr, self._p._rotation + i * 20))
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(accent), 1))
+        p.drawText(QRectF(cx + r + 10, cy - 8, W - cx - r - 14, 16),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "INGESTING...")
+
+    def _paint_loaded(self, p, W, H, cx, cy, r):
+        path = Path(self._p._current_file)
+        cat = _file_category(path)
+        _, icon_col = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
+        size_str = _fmt_size(path.stat().st_size)
+        ext_str = path.suffix.upper().lstrip(".") or "RAW"
+
+        p.setBrush(QBrush(qcol(icon_col, 40)))
+        p.setPen(QPen(qcol(icon_col), 1.5))
+        p.drawPath(_hex_path(cx, cy, r * 0.5))
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(icon_col), 1))
+        p.drawText(QRectF(cx - r, cy - 7, r * 2, 14), Qt.AlignmentFlag.AlignCenter, ext_str[:4])
+
+        tx = cx + r + 12
+        tw = W - tx - 28
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.WHITE), 1))
+        name = path.name if len(path.name) <= 28 else path.name[:25] + "..."
+        p.drawText(QRectF(tx, cy - 20, tw, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+        p.drawText(QRectF(tx, cy - 4, tw, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, size_str)
+        p.setPen(QPen(qcol("#1e5c6a"), 1))
+        par = str(path.parent)
+        if len(par) > 32:
+            par = "…" + par[-31:]
+        p.drawText(QRectF(tx, cy + 10, tw, 11),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, par)
+
+        p.setPen(QPen(qcol(C.RED, 160), 1))
+        p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        p.drawText(QRectF(W - 26, cy - 10, 20, 20), Qt.AlignmentFlag.AlignCenter, "×")
+
+    def mousePressEvent(self, e):
+        z = self._p
+        if z._current_file and e.pos().x() > self.width() - 30:
+            z.clear_file()
+        else:
+            z.mousePressEvent(e)
+
+
+class VaultStatusStrip(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = "VAULT EMPTY · AWAITING PAYLOAD"
+        self._accent = C.TEXT_DIM
+        self._dots = 0
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(400)
+        self.setFixedHeight(20)
+
+    def set_text(self, text: str, accent: str = C.GREEN):
+        self._text = text
+        self._accent = accent
+        self.update()
+
+    def set_idle(self):
+        self._text = "VAULT EMPTY · AWAITING PAYLOAD"
+        self._accent = C.TEXT_DIM
+        self.update()
+
+    def _tick(self):
+        self._dots = (self._dots + 1) % 4
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W = self.width()
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(self._accent), 1))
+        suffix = "." * self._dots if "AWAITING" in self._text else ""
+        p.drawText(QRectF(8, 2, W - 12, 14),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                   self._text + suffix)
+
+
+class TransmitConsole(QWidget):
+    transmit = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._accent = C.GREEN
+        self._phase = 0.0
+        self._focused = False
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._tick)
+        self._tmr.start(60)
+        self.setFixedHeight(52)
+
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("enter directive...")
+        self.input.setFont(QFont("Consolas", 9))
+        self.input.setStyleSheet("""
+            QLineEdit {
+                background: transparent;
+                color: #d8f8ff;
+                border: none;
+                padding: 0px 4px;
+            }
+        """)
+        self.input.installEventFilter(self)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 22, 46, 6)
+        lay.addWidget(self.input)
+
+        self._send_btn = QPushButton(self)
+        self._send_btn.setFixedSize(34, 34)
+        self._send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send_btn.setStyleSheet("background: transparent; border: none;")
+        self._send_btn.clicked.connect(self.transmit.emit)
+        self.input.returnPressed.connect(self.transmit.emit)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def eventFilter(self, obj, event):
+        if obj is self.input:
+            if event.type() == QEvent.Type.FocusIn:
+                self._focused = True
+                self.update()
+            elif event.type() == QEvent.Type.FocusOut:
+                self._focused = False
+                self.update()
+        return super().eventFilter(obj, event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._send_btn.move(self.width() - 42, self.height() - 38)
+
+    def _tick(self):
+        self._phase = (self._phase + 0.1) % (2 * math.pi)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        field = QRectF(6, 18, W - 12, H - 22)
+
+        p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(self._accent), 1))
+        p.drawText(QRectF(10, 4, W - 16, 12),
+                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "TRANSMIT")
+
+        border_a = 140 if self._focused else 70
+        p.setBrush(QBrush(qcol("#000a0e", 230)))
+        p.setPen(QPen(qcol(self._accent, border_a), 1))
+        p.drawPath(_chamfer_rect(field.x(), field.y(), field.width(), field.height(), 4))
+
+        if self._focused:
+            blink = int(180 + 75 * math.sin(self._phase * 3))
+            p.setPen(QPen(qcol(self._accent, blink), 1))
+            p.drawLine(QPointF(field.x() + 4, field.y() + 3),
+                       QPointF(field.right() - 4, field.y() + 3))
+
+        sx = W - 38
+        sy = field.center().y()
+        send_path = _hex_path(sx, sy, 13)
+        p.setBrush(QBrush(qcol(self._accent, 35)))
+        p.setPen(QPen(qcol(self._accent), 1.5))
+        p.drawPath(send_path)
+        p.setPen(QPen(qcol(self._accent), 2))
+        p.drawLine(QPointF(sx - 5, sy), QPointF(sx + 6, sy))
+        p.drawLine(QPointF(sx + 2, sy - 5), QPointF(sx + 6, sy))
+        p.drawLine(QPointF(sx + 2, sy + 5), QPointF(sx + 6, sy))
+
+
+class GlyphButton(QWidget):
+    clicked = pyqtSignal()
+
+    def __init__(self, glyph: str, label: str, accent: str, parent=None):
+        super().__init__(parent)
+        self._glyph = glyph
+        self._label = label
+        self._accent = accent
+        self._hover = False
+        self._active = False
+        self.setFixedSize(72, 46)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_accent(self, color: str):
+        self._accent = color
+        self.update()
+
+    def set_active(self, active: bool):
+        self._active = active
+        self.update()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        cx, cy = W / 2, H / 2 - 4
+        col = qcol(self._accent)
+        if self._hover:
+            col = QColor(col)
+            col.setAlpha(255)
+        bg_a = 55 if self._active else (35 if self._hover else 15)
+        p.setBrush(QBrush(qcol(self._accent, bg_a)))
+        p.setPen(QPen(qcol(self._accent, 160 if self._hover else 90), 1))
+        p.drawPath(_chamfer_rect(4, 4, W - 8, H - 10, 5))
+
+        p.setPen(QPen(col, 1.5))
+        if self._glyph == "mic":
+            p.setBrush(QBrush(qcol(self._accent, 50)))
+            p.drawEllipse(QPointF(cx, cy - 2), 5, 7)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawLine(QPointF(cx, cy + 6), QPointF(cx, cy + 11))
+            p.drawLine(QPointF(cx - 5, cy + 11), QPointF(cx + 5, cy + 11))
+            if self._active:
+                p.setPen(QPen(qcol(C.MUTED_C), 2))
+                p.drawLine(QPointF(cx - 7, cy - 7), QPointF(cx + 7, cy + 7))
+        elif self._glyph == "halt":
+            p.setBrush(QBrush(qcol(C.RED, 60)))
+            p.setPen(QPen(qcol(C.RED), 1.5))
+            p.drawRect(QRectF(cx - 6, cy - 6, 12, 12))
+        elif self._glyph == "expand":
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            for dx, dy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+                ox, oy = cx + dx * 8, cy + dy * 6
+                p.drawLine(QPointF(ox, oy), QPointF(ox + 5 * dx, oy))
+                p.drawLine(QPointF(ox, oy), QPointF(ox, oy + 5 * dy))
+
+        p.setFont(QFont("Consolas", 5, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(self._accent if self._hover else C.TEXT_DIM), 1))
+        p.drawText(QRectF(0, H - 14, W, 12), Qt.AlignmentFlag.AlignCenter, self._label)
+
+
+class GlyphControlDeck(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(52)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(4, 0, 4, 0)
+        lay.setSpacing(6)
+        self.mic = GlyphButton("mic", "VOICE", C.GREEN)
+        self.halt = GlyphButton("halt", "HALT", C.RED)
+        self.expand = GlyphButton("expand", "VIEW", C.TEXT_DIM)
+        for btn in (self.mic, self.halt, self.expand):
+            lay.addWidget(btn)
+
+    def set_accent(self, color: str):
+        self.mic.set_accent(color)
+
+    def set_mute_active(self, muted: bool):
+        self.mic.set_accent(C.MUTED_C if muted else C.GREEN)
+        self.mic.set_active(muted)
+        self.mic._label = "MUTED" if muted else "VOICE"
+        self.mic.update()
 
 
 class LogWidget(QTextEdit):
     _sig = pyqtSignal(str)
+    _stream_sig = pyqtSignal(str, str)
+    _stream_end_sig = pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, realtime: bool = False):
         super().__init__(parent)
         self.setReadOnly(True)
+        self._realtime = realtime
+        self._stream_tag: str | None = None
+        self._stream_accum = ""
+        self._stream_last_char = ""
         self.setFont(QFont("Consolas", 9))
         self.setStyleSheet(f"""
             QTextEdit {{
@@ -891,9 +2026,134 @@ class LogWidget(QTextEdit):
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._sig.connect(self._enqueue)
+        self._stream_sig.connect(self._on_stream_chunk)
+        self._stream_end_sig.connect(self._on_stream_end)
 
     def append_log(self, text: str):
-        self._sig.emit(text)
+        if self._realtime:
+            self._append_instant(text)
+        else:
+            self._sig.emit(text)
+
+    def stream_chunk(self, speaker: str, chunk: str):
+        if not chunk:
+            return
+        if self._realtime:
+            self._stream_sig.emit(speaker, chunk)
+        else:
+            self.append_log(f"{'You' if speaker == 'you' else 'Jarvis'}: {chunk}")
+
+    def stream_finish(self, speaker: str):
+        if self._realtime:
+            self._stream_end_sig.emit(speaker)
+
+    def _tag_for_speaker(self, speaker: str) -> tuple[str, str]:
+        if speaker == "you":
+            return "you", "You: "
+        return "ai", "Jarvis: "
+
+    def _fmt_for_tag(self, tag: str) -> QColor:
+        return {
+            "you":  qcol(C.WHITE),
+            "ai":   qcol(C.PRI),
+            "err":  qcol(C.RED),
+            "file": qcol(C.GREEN),
+            "sys":  qcol(C.ACC2),
+            "info": qcol(C.TEXT_MED),
+        }.get(tag, qcol(C.TEXT))
+
+    def _speaker_label(self, tag: str) -> str:
+        return {
+            "you": "YOU", "ai": "JARVIS", "sys": "SYSTEM",
+            "file": "FILE", "err": "ERROR", "info": "INFO",
+        }.get(tag, "LOG")
+
+    def _insert_block_header(self, tag: str):
+        label = self._speaker_label(tag)
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        rule = f"── {label} " + "─" * max(8, 42 - len(label))
+        hdr_fmt = cur.charFormat()
+        hdr_fmt.setForeground(QBrush(self._fmt_for_tag(tag)))
+        hdr_fmt.setFontWeight(QFont.Weight.Bold)
+        cur.insertText(f"\n{rule}\n", hdr_fmt)
+        self.setTextCursor(cur)
+
+    def _insert_body(self, tag: str, text: str):
+        cur = self.textCursor()
+        body_fmt = cur.charFormat()
+        body_fmt.setForeground(QBrush(self._fmt_for_tag(tag)))
+        body_fmt.setFontWeight(QFont.Weight.Normal)
+        cur.movePosition(cur.MoveOperation.End)
+        cur.insertText(f"  {text.strip()}\n\n", body_fmt)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
+    def _delta_chunk(self, chunk: str) -> str:
+        chunk = chunk.replace("\n", " ").strip()
+        if not chunk:
+            return ""
+        if self._stream_accum and chunk.startswith(self._stream_accum):
+            return chunk[len(self._stream_accum):]
+        if (
+            self._stream_last_char
+            and self._stream_last_char.isalnum()
+            and chunk[0].isalnum()
+        ):
+            return " " + chunk
+        return chunk
+
+    def _append_instant(self, text: str):
+        tl = text.lower()
+        if   tl.startswith("you:"):    tag, body = "you", text[4:].strip()
+        elif tl.startswith("jarvis:"): tag, body = "ai", text[7:].strip()
+        elif tl.startswith("file:"):   tag, body = "file", text[5:].strip()
+        elif "err" in tl:              tag, body = "err", text
+        elif tl.startswith("sys:"):    tag, body = "sys", text[4:].strip()
+        else:                          tag, body = "info", text
+        self._insert_block_header(tag)
+        self._insert_body(tag, body)
+
+    def _on_stream_chunk(self, speaker: str, chunk: str):
+        tag, _ = self._tag_for_speaker(speaker)
+        delta = self._delta_chunk(chunk)
+        if not delta:
+            return
+        if self._stream_tag != tag:
+            self._on_stream_end(speaker)
+            self._stream_tag = tag
+            self._stream_accum = ""
+            self._stream_last_char = ""
+            self._insert_block_header(tag)
+            cur = self.textCursor()
+            body_fmt = cur.charFormat()
+            body_fmt.setForeground(QBrush(self._fmt_for_tag(tag)))
+            body_fmt.setFontWeight(QFont.Weight.Normal)
+            cur.movePosition(cur.MoveOperation.End)
+            cur.insertText("  ", body_fmt)
+            self.setTextCursor(cur)
+        cur = self.textCursor()
+        fmt = cur.charFormat()
+        fmt.setForeground(QBrush(self._fmt_for_tag(tag)))
+        fmt.setFontWeight(QFont.Weight.Normal)
+        cur.movePosition(cur.MoveOperation.End)
+        cur.insertText(delta, fmt)
+        self.setTextCursor(cur)
+        self._stream_accum += delta
+        self._stream_last_char = delta[-1]
+        self.ensureCursorVisible()
+
+    def _on_stream_end(self, _speaker: str = ""):
+        if self._stream_tag is None:
+            return
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        cur.insertText("\n\n")
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+        self._stream_tag = None
+        self._stream_accum = ""
+        self._stream_last_char = ""
 
     def _enqueue(self, text: str):
         self._queue.append(text)
@@ -989,188 +2249,6 @@ def _fmt_size(size: int) -> str:
     elif size < 1024**2: return f"{size/1024:.1f} KB"
     elif size < 1024**3: return f"{size/1024**2:.1f} MB"
     else:                return f"{size/1024**3:.1f} GB"
-
-
-class FileDropZone(QWidget):
-    file_selected = pyqtSignal(str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAcceptDrops(True)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(100)
-        self._current_file: str | None = None
-        self._hovering  = False
-        self._drag_over = False
-        self._dash_offset = 0.0
-        self._anim_tmr = QTimer(self)
-        self._anim_tmr.timeout.connect(self._animate)
-        self._anim_tmr.start(40)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        self._canvas = _DropCanvas(self)
-        layout.addWidget(self._canvas)
-
-    def _animate(self):
-        self._dash_offset = (self._dash_offset + 0.8) % 20
-        self._canvas.update()
-
-    def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-            self._drag_over = True; self._canvas.update()
-
-    def dragLeaveEvent(self, e):
-        self._drag_over = False; self._canvas.update()
-
-    def dropEvent(self, e: QDropEvent):
-        self._drag_over = False
-        urls = e.mimeData().urls()
-        if urls:
-            path = urls[0].toLocalFile()
-            if Path(path).is_file():
-                self._set_file(path)
-        self._canvas.update()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._browse()
-
-    def enterEvent(self, e):
-        self._hovering = True; self._canvas.update()
-
-    def leaveEvent(self, e):
-        self._hovering = False; self._canvas.update()
-
-    def current_file(self) -> str | None:
-        return self._current_file
-
-    def clear_file(self):
-        self._current_file = None; self._canvas.update()
-
-    def _browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select a file for JARVIS", str(Path.home()),
-            "All Files (*.*);;"
-            "Images (*.jpg *.jpeg *.png *.gif *.webp *.bmp *.svg);;"
-            "Documents (*.pdf *.docx *.txt *.md *.pptx);;"
-            "Data (*.csv *.xlsx *.json *.xml);;"
-            "Code (*.py *.js *.ts *.html *.css *.java *.cpp *.go);;"
-            "Audio (*.mp3 *.wav *.ogg *.m4a *.aac *.flac);;"
-            "Video (*.mp4 *.avi *.mov *.mkv *.wmv *.webm);;"
-            "Archives (*.zip *.rar *.tar *.gz *.7z)",
-        )
-        if path:
-            self._set_file(path)
-
-    def _set_file(self, path: str):
-        self._current_file = path
-        self._canvas.update()
-        self.file_selected.emit(path)
-
-
-class _DropCanvas(QWidget):
-    def __init__(self, zone: FileDropZone):
-        super().__init__(zone)
-        self._z = zone
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        z    = self._z
-        W, H = self.width(), self.height()
-        pad  = 6
-        rect = QRectF(pad, pad, W - pad * 2, H - pad * 2)
-
-        bg_col = qcol("#001a24" if z._drag_over else ("#001218" if z._hovering else C.PANEL))
-        p.setBrush(QBrush(bg_col)); p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(rect, 6, 6)
-
-        if z._current_file:   border_col = qcol(C.GREEN, 200)
-        elif z._drag_over:    border_col = qcol(C.PRI, 230)
-        elif z._hovering:     border_col = qcol(C.BORDER_B, 200)
-        else:                 border_col = qcol(C.BORDER, 160)
-
-        pen = QPen(border_col, 1.5, Qt.PenStyle.DashLine)
-        pen.setDashOffset(z._dash_offset)
-        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(rect, 6, 6)
-
-        if z._current_file:   self._paint_file(p, W, H)
-        elif z._drag_over:    self._paint_drag_over(p, W, H)
-        else:                 self._paint_idle(p, W, H, z._hovering)
-
-    def _paint_idle(self, p, W, H, hover):
-        cx, cy = W / 2, H / 2
-        col = qcol(C.PRI_DIM if not hover else C.PRI)
-        p.setPen(QPen(col, 2)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawLine(QPointF(cx, cy - 14), QPointF(cx, cy + 4))
-        p.drawLine(QPointF(cx - 8, cy - 6), QPointF(cx, cy - 14))
-        p.drawLine(QPointF(cx + 8, cy - 6), QPointF(cx, cy - 14))
-        p.drawLine(QPointF(cx - 14, cy + 4), QPointF(cx + 14, cy + 4))
-        p.setFont(QFont("Courier New", 8))
-        p.setPen(QPen(qcol(C.PRI_DIM if not hover else C.TEXT), 1))
-        p.drawText(QRectF(0, cy + 8, W, 16), Qt.AlignmentFlag.AlignCenter,
-                   "Drop file here  or  Click to Browse")
-        p.setFont(QFont("Courier New", 7))
-        p.setPen(QPen(qcol("#1a4a5a"), 1))
-        p.drawText(QRectF(0, cy + 24, W, 14), Qt.AlignmentFlag.AlignCenter,
-                   "Images · Video · Audio · PDF · Docs · Code · Data")
-
-    def _paint_drag_over(self, p, W, H):
-        cx, cy = W / 2, H / 2
-        p.setFont(QFont("Courier New", 20))
-        p.setPen(QPen(qcol(C.PRI), 1))
-        p.drawText(QRectF(0, cy - 24, W, 32), Qt.AlignmentFlag.AlignCenter, "⬇")
-        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        p.setPen(QPen(qcol(C.PRI), 1))
-        p.drawText(QRectF(0, cy + 12, W, 16), Qt.AlignmentFlag.AlignCenter, "Release to load")
-
-    def _paint_file(self, p, W, H):
-        path = Path(self._z._current_file)
-        cat  = _file_category(path)
-        icon, icon_col = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
-        size_str = _fmt_size(path.stat().st_size)
-        ext_str  = path.suffix.upper().lstrip(".") or "FILE"
-
-        block_x, block_w = 10, 60
-        p.setFont(QFont("Segoe UI Emoji", 22) if _OS == "Windows" else QFont("Arial", 22))
-        p.setPen(QPen(qcol(icon_col), 1))
-        p.drawText(QRectF(block_x, 0, block_w, H), Qt.AlignmentFlag.AlignCenter, icon)
-
-        tx = block_x + block_w + 6
-        tw = W - tx - 38
-
-        p.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        p.setPen(QPen(qcol(C.WHITE), 1))
-        name = path.name if len(path.name) <= 34 else path.name[:31] + "..."
-        p.drawText(QRectF(tx, H * 0.18, tw, 16),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
-
-        p.setFont(QFont("Courier New", 7))
-        p.setPen(QPen(qcol(C.TEXT_DIM), 1))
-        p.drawText(QRectF(tx, H * 0.18 + 18, tw, 14),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                   f"{ext_str}  ·  {size_str}")
-
-        p.setFont(QFont("Courier New", 6))
-        p.setPen(QPen(qcol("#1e5c6a"), 1))
-        par = str(path.parent)
-        if len(par) > 42: par = "…" + par[-41:]
-        p.drawText(QRectF(tx, H * 0.18 + 34, tw, 12),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, par)
-
-        p.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
-        p.setPen(QPen(qcol(C.RED, 180), 1))
-        p.drawText(QRectF(W - 34, 0, 28, H), Qt.AlignmentFlag.AlignCenter, "✕")
-
-    def mousePressEvent(self, e):
-        z = self._z
-        if z._current_file and e.pos().x() > self.width() - 34:
-            z.clear_file()
-        else:
-            z.mousePressEvent(e)
 
 
 class SetupOverlay(QWidget):
@@ -1305,8 +2383,11 @@ class SetupOverlay(QWidget):
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)   # Terminal Activity
     _chat_sig  = pyqtSignal(str)   # Communications Log
-    _state_sig = pyqtSignal(str)
-    _play_sig  = pyqtSignal(str)
+    _chat_stream_sig     = pyqtSignal(str, str)
+    _chat_stream_end_sig = pyqtSignal(str)
+    _state_sig    = pyqtSignal(str)
+    _play_sig     = pyqtSignal(str)
+    _startup_sig  = pyqtSignal()
 
 
     def __init__(self, face_path: str):
@@ -1350,19 +2431,13 @@ class MainWindow(QMainWindow):
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         center_col.addWidget(self.hud, stretch=5)
 
-        self._activity_log = LogWidget()
-        self._activity_log.setFixedHeight(120)
-        self._activity_log.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._activity_log.setStyleSheet(f"""
-            QTextEdit {{
-                background: transparent;
-                border: none;
-                border-top: 1px solid {C.BORDER};
-                color: {C.PRI};
-                padding: 4px 8px;
-            }}
-        """)
-        center_col.addWidget(self._activity_log, stretch=0)
+        self._neural_header = NeuralLinkHeader()
+        center_col.addWidget(self._neural_header)
+
+        self._comms_viewport = CommsViewport()
+        self._comms_viewport.setFixedHeight(172)
+        self._log = self._comms_viewport.log
+        center_col.addWidget(self._comms_viewport, stretch=0)
 
         body.addLayout(center_col, stretch=5)
 
@@ -1384,8 +2459,12 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._activity_log.append_log)
         self._chat_sig.connect(self._log.append_log)
+        self._chat_stream_sig.connect(self._log.stream_chunk)
+        self._chat_stream_end_sig.connect(self._log.stream_finish)
+        self._set_center_accent(C.PRI)
         self._state_sig.connect(self._apply_state)
         self._play_sig.connect(self._on_play_requested)
+        self._startup_sig.connect(self.start_startup_sequence)
 
         self._overlay: SetupOverlay | None = None
 
@@ -1397,6 +2476,90 @@ class MainWindow(QMainWindow):
         sc_mute.activated.connect(self._toggle_mute)
         sc_full = QShortcut(QKeySequence("F11"), self)
         sc_full.activated.connect(self._toggle_fullscreen)
+
+        self._state_blend = 0.0
+        self._state_target = 0.0
+        self._pending_state = "LISTENING"
+        self._startup_init_running = False
+        self._startup_init_done = True
+        self._startup_done_event = threading.Event()
+        self._startup_done_event.set()
+        self._startup_duration_ms = 0
+        self._transition_overlay = StateTransitionOverlay(central)
+        self._transition_overlay.setGeometry(central.rect())
+        central.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if obj is self.centralWidget() and event.type() == QEvent.Type.Resize:
+            rect = self.centralWidget().rect()
+            self._transition_overlay.setGeometry(rect)
+        return super().eventFilter(obj, event)
+
+    def start_startup_sequence(self):
+        """Animate HUD arcs in sync with startup.mp3."""
+        if self._startup_init_running:
+            return
+        self._startup_init_running = True
+        self._startup_init_done = False
+        self._startup_done_event.clear()
+        self._startup_duration_ms = 0
+        self.hud.reset_for_startup_init()
+        self._apply_state("INITIALISING")
+
+        path = BASE_DIR / "assets" / "startup.mp3"
+        if not path.exists():
+            print(f"[UI] Startup sound not found: {path}")
+            self._finish_startup_init()
+            return
+
+        player = QMediaPlayer(self)
+        audio = QAudioOutput(self)
+        player.setAudioOutput(audio)
+        player.setSource(QUrl.fromLocalFile(str(path)))
+        audio.setVolume(0.9)
+        self._startup_player = player
+        self._startup_audio = audio
+        self._startup_init_start = time.perf_counter()
+
+        player.durationChanged.connect(self._on_startup_duration)
+        player.mediaStatusChanged.connect(self._on_startup_media_status)
+        player.errorOccurred.connect(lambda *_: self._finish_startup_init())
+
+        if not hasattr(self, "_startup_init_tmr"):
+            self._startup_init_tmr = QTimer(self)
+            self._startup_init_tmr.timeout.connect(self._tick_startup_init)
+        self._startup_init_tmr.start(16)
+        player.play()
+        print("[UI] Startup sequence: arcs synced to startup.mp3")
+
+    def _on_startup_duration(self, duration_ms: int):
+        if duration_ms > 0:
+            self._startup_duration_ms = duration_ms
+
+    def _on_startup_media_status(self, status):
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._finish_startup_init()
+
+    def _tick_startup_init(self):
+        player = getattr(self, "_startup_player", None)
+        if player and self._startup_duration_ms > 0:
+            progress = min(1.0, player.position() / max(1, self._startup_duration_ms))
+        else:
+            progress = min(1.0, (time.perf_counter() - self._startup_init_start) / 2.8)
+        self.hud.set_wake_up_progress(progress)
+        if progress >= 0.995:
+            self._finish_startup_init()
+
+    def _finish_startup_init(self):
+        if self._startup_init_done:
+            return
+        self._startup_init_done = True
+        self._startup_init_running = False
+        if hasattr(self, "_startup_init_tmr"):
+            self._startup_init_tmr.stop()
+        self.hud.set_wake_up_progress(1.0)
+        self._startup_done_event.set()
+        print("[UI] Startup sequence complete.")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -1455,355 +2618,134 @@ class MainWindow(QMainWindow):
             elapsed = time.time() - boot_t
             h = int(elapsed // 3600)
             m = int((elapsed % 3600) // 60)
-            self._uptime_lbl.setText(f"UP  {h:02d}:{m:02d}")
+            self._telemetry.set_line(0, "UP", f"{h:02d}:{m:02d}", C.GREEN)
         except Exception:
-            self._uptime_lbl.setText("UP  --:--")
+            self._telemetry.set_line(0, "UP", "--:--", C.TEXT_DIM)
 
         try:
             proc_count = len(psutil.pids())
-            self._proc_lbl.setText(f"PROC  {proc_count}")
+            self._telemetry.set_line(1, "PROC", str(proc_count), C.TEXT_MED)
         except Exception:
-            self._proc_lbl.setText("PROC  --")
+            self._telemetry.set_line(1, "PROC", "--", C.TEXT_DIM)
+
+        os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
+        self._telemetry.set_line(2, "OS", os_name, C.ACC2)
 
 
     def _build_header(self) -> QWidget:
-        w = QWidget()
-        w.setFixedHeight(56)
-        w.setStyleSheet(f"""
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                stop:0 {C.DARK}, stop:0.5 {C.PANEL2}, stop:1 {C.DARK});
-            border-bottom: 1px solid {C.BORDER_B};
-        """)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(18, 0, 18, 0)
-
-        # Left badge with glow effect
-        badge_container = QWidget()
-        badge_container.setFixedWidth(90)
-        badge_lay = QVBoxLayout(badge_container)
-        badge_lay.setContentsMargins(0, 0, 0, 0)
-        badge_lay.setSpacing(2)
-        
-        badge = QLabel("MARK XXXIX")
-        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        badge.setStyleSheet(f"""
-            color: {C.PRI}; 
-            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                stop:0 {C.PRI_GHO}, stop:1 {C.DARK});
-            padding: 4px 8px; 
-            border: 1px solid {C.PRI_DIM}; 
-            border-radius: 4px;
-        """)
-        badge_lay.addWidget(badge)
-        
-        version = QLabel("v39.0")
-        version.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        version.setFont(QFont("Consolas", 6))
-        version.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        badge_lay.addWidget(version)
-        
-        lay.addWidget(badge_container)
-        lay.addStretch()
-
-        # Center title with enhanced styling
-        mid = QVBoxLayout(); mid.setSpacing(2)
-        title = QLabel("J.A.R.V.I.S")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
-        title.setStyleSheet(f"""
-            color: {C.PRI}; 
-            background: transparent; 
-            letter-spacing: 6px;
-        """)
-        mid.addWidget(title)
-        sub = QLabel("Just A Rather Very Intelligent System")
-        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub.setFont(QFont("Consolas", 7))
-        sub.setStyleSheet(f"""
-            color: {C.TEXT_MED}; 
-            background: transparent;
-            letter-spacing: 1px;
-        """)
-        mid.addWidget(sub)
-        lay.addLayout(mid)
-        lay.addStretch()
-
-        # Right clock with modern styling
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
-        self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
-        self._clock_lbl.setStyleSheet(f"""
-            color: {C.PRI}; 
-            background: transparent;
-        """)
-        self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
-        self._date_lbl = QLabel("")
-        self._date_lbl.setFont(QFont("Consolas", 7))
-        self._date_lbl.setStyleSheet(f"""
-            color: {C.TEXT_MED}; 
-            background: transparent;
-        """)
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._date_lbl)
-        lay.addLayout(right_col)
-        return w
+        self._header = OrbitalCommandStrip()
+        self._tick_clock()
+        return self._header
 
     def _tick_clock(self):
-        self._clock_lbl.setText(time.strftime("%H:%M:%S"))
-        self._date_lbl.setText(time.strftime("%a %d %b %Y").upper())
+        if hasattr(self, "_header"):
+            self._header.set_clock(
+                time.strftime("%H:%M:%S"),
+                time.strftime("%a %d %b %Y").upper(),
+            )
 
     def _build_left_panel(self) -> QWidget:
-        w = QWidget()
+        w = LeftPanelRail()
+        w.setObjectName("sidePanel")
         w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-right: 1px solid {C.BORDER};")
+
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 10, 8, 10)
-        lay.setSpacing(8)
+        lay.setContentsMargins(10, 12, 8, 12)
+        lay.setSpacing(6)
 
-        # System Status Card
-        status_card = SystemStatusCard()
-        lay.addWidget(status_card)
+        lay.addWidget(LinkStatusStrip())
 
-        # Section header
-        hdr = QLabel("◈ SYSTEM METRICS")
-        hdr.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; padding-bottom: 2px;")
+        hdr = QLabel("TELEMETRY STACK")
+        hdr.setObjectName("panelTitle")
+        hdr.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+        hdr.setStyleSheet(
+            f"color: {C.PRI}; background: transparent; letter-spacing: 2px; padding: 2px 0;"
+        )
         lay.addWidget(hdr)
 
-        # Separator
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"color: {C.BORDER};")
-        lay.addWidget(sep)
-        lay.addSpacing(4)
+        self._gauge_cpu = HexMetricCell("CPU", C.PRI)
+        self._gauge_mem = HexMetricCell("MEM", C.ACC2)
+        self._gauge_gpu = HexMetricCell("GPU", C.ACC)
+        self._gauge_tmp = HexMetricCell("TMP", "#ff6688")
+        for gauge in (self._gauge_cpu, self._gauge_mem, self._gauge_gpu, self._gauge_tmp):
+            lay.addWidget(gauge)
 
-        # Circular gauges for primary metrics (2x2 grid)
-        gauges_layout = QHBoxLayout()
-        gauges_layout.setSpacing(6)
-        
-        self._gauge_cpu = CircularGauge("CPU", C.PRI, size=62)
-        self._gauge_mem = CircularGauge("MEM", C.ACC2, size=62)
-        gauges_layout.addWidget(self._gauge_cpu)
-        gauges_layout.addWidget(self._gauge_mem)
-        lay.addLayout(gauges_layout)
-
-        gauges_layout2 = QHBoxLayout()
-        gauges_layout2.setSpacing(6)
-        
-        self._gauge_gpu = CircularGauge("GPU", C.ACC, size=62)
-        self._gauge_tmp = CircularGauge("TMP", "#ff6688", size=62)
-        gauges_layout2.addWidget(self._gauge_gpu)
-        gauges_layout2.addWidget(self._gauge_tmp)
-        lay.addLayout(gauges_layout2)
-
-        lay.addSpacing(6)
-
-        # Secondary metrics as compact bars
-        self._bar_net = MetricBar("NET", C.GREEN)
+        self._bar_net = SegmentTelemetryBar("NET", C.GREEN)
         lay.addWidget(self._bar_net)
 
-        lay.addSpacing(8)
+        lay.addSpacing(4)
 
-        # System info panel
-        info_panel = QWidget()
-        info_panel.setStyleSheet(
-            f"background: #010810; border: 1px solid {C.BORDER}; border-radius: 4px;"
-        )
-        ip_lay = QVBoxLayout(info_panel)
-        ip_lay.setContentsMargins(8, 6, 8, 6)
-        ip_lay.setSpacing(3)
-
-        self._uptime_lbl = QLabel("UP  --:--")
-        self._uptime_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        self._uptime_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; border: none;")
-        ip_lay.addWidget(self._uptime_lbl)
-
-        self._proc_lbl = QLabel("PROC  --")
-        self._proc_lbl.setFont(QFont("Consolas", 7))
-        self._proc_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent; border: none;")
-        ip_lay.addWidget(self._proc_lbl)
-
+        self._telemetry = TelemetryReadout()
         os_name = {"Windows": "WIN", "Darwin": "macOS", "Linux": "LINUX"}.get(_OS, _OS.upper())
-        os_lbl = QLabel(f"OS  {os_name}")
-        os_lbl.setFont(QFont("Consolas", 7))
-        os_lbl.setStyleSheet(f"color: {C.ACC2}; background: transparent; border: none;")
-        ip_lay.addWidget(os_lbl)
+        self._telemetry.set_line(0, "UP", "--:--", C.GREEN)
+        self._telemetry.set_line(1, "PROC", "--", C.TEXT_MED)
+        self._telemetry.set_line(2, "OS", os_name, C.ACC2)
+        lay.addWidget(self._telemetry)
 
-        lay.addWidget(info_panel)
         lay.addStretch()
 
-        # Status badges
-        for txt, col in [
-            ("AI CORE\nACTIVE",     C.GREEN),
-            ("SEC\nCLEARED",        C.PRI),
-            ("PROTOCOL\nXXXIX",     C.TEXT_DIM),
-        ]:
-            lbl = QLabel(txt)
-            lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet(
-                f"color: {col}; background: #010810;"
-                f"border: 1px solid {C.BORDER}; border-radius: 4px; padding: 4px;"
-            )
-            lay.addWidget(lbl)
+        self._status_leds = StatusLedColumn([
+            ("AI CORE · ACTIVE", C.GREEN),
+            ("SEC · CLEARED", C.PRI),
+            ("PROTOCOL · XXXIX", C.TEXT_DIM),
+        ])
+        lay.addWidget(self._status_leds)
 
         return w
 
     def _build_right_panel(self) -> QWidget:
-        w = QWidget()
+        w = RightPanelRail()
+        w.setObjectName("rightPanel")
         w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
+        self._right_rail = w
+
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
+        lay.setContentsMargins(8, 10, 10, 10)
+        lay.setSpacing(8)
 
-        # Communications Log
-        log_lbl = QLabel("COMMUNICATIONS")
-        log_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        log_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; padding: 2px 0;")
-        lay.addWidget(log_lbl)
-        
-        self._log = LogWidget()
-        self._log.setStyleSheet(f"""
-            QTextEdit {{
-                background: {C.PANEL};
-                border: 1px solid {C.BORDER};
-                border-radius: 4px;
-                color: {C.TEXT};
-                padding: 6px;
-            }}
-            QScrollBar:vertical {{
-                background: {C.BG};
-                width: 6px;
-                border: none;
-                border-radius: 3px;
-            }}
-            QScrollBar::handle:vertical {{
-                background: {C.BORDER_B};
-                border-radius: 3px;
-                min-height: 20px;
-            }}
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
-                height: 0px;
-            }}
-        """)
-        lay.addWidget(self._log, stretch=1)
+        self._terminal_header = SysTerminalHeader()
+        lay.addWidget(self._terminal_header)
 
-        # Separator
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFixedHeight(1)
-        sep.setStyleSheet(f"color: {C.BORDER};")
-        lay.addWidget(sep)
+        self._terminal_viewport = CommsViewport()
+        self._activity_log = self._terminal_viewport.log
+        lay.addWidget(self._terminal_viewport, stretch=1)
 
-        # File Upload
-        file_lbl = QLabel("FILE UPLOAD")
-        file_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        file_lbl.setStyleSheet(f"color: {C.ACC}; background: transparent; padding: 2px 0;")
-        lay.addWidget(file_lbl)
-        
-        self._drop_zone = FileDropZone()
+        self._vault_tag = SectionTag("DATA VAULT // PAYLOAD INJECTION", C.ACC)
+        lay.addWidget(self._vault_tag)
+
+        self._drop_zone = DataVaultPort()
         self._drop_zone.file_selected.connect(self._on_file_selected)
         lay.addWidget(self._drop_zone)
 
-        self._file_hint = QLabel("No file loaded")
-        self._file_hint.setFont(QFont("Consolas", 7))
-        self._file_hint.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        self._file_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(self._file_hint)
+        self._vault_status = VaultStatusStrip()
+        lay.addWidget(self._vault_status)
 
-        # Separator
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setFixedHeight(1)
-        sep2.setStyleSheet(f"color: {C.BORDER};")
-        lay.addWidget(sep2)
+        self._transmit = TransmitConsole()
+        self._input = self._transmit.input
+        self._transmit.transmit.connect(self._send)
+        lay.addWidget(self._transmit)
 
-        # Command Input
-        cmd_lbl = QLabel("COMMAND INPUT")
-        cmd_lbl.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
-        cmd_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent; padding: 2px 0;")
-        lay.addWidget(cmd_lbl)
-        
-        lay.addLayout(self._build_input_row())
-
-        # Action buttons
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(4)
-        
-        self._mute_btn = QPushButton("🎙 Mic")
-        self._mute_btn.setFixedHeight(28)
-        self._mute_btn.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._mute_btn.clicked.connect(self._toggle_mute)
+        self._controls = GlyphControlDeck()
+        self._controls.mic.clicked.connect(self._toggle_mute)
+        self._controls.halt.clicked.connect(self._interrupt)
+        self._controls.expand.clicked.connect(self._toggle_fullscreen)
         self._style_mute_btn()
-        btn_row.addWidget(self._mute_btn)
-
-        self._interrupt_btn = QPushButton("🛑 Stop")
-        self._interrupt_btn.setFixedHeight(28)
-        self._interrupt_btn.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._interrupt_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: #0a0000; color: {C.RED};
-                border: 1px solid {C.RED}; border-radius: 4px;
-            }}
-            QPushButton:hover {{ background: #1a0000; border: 1px solid #ff0000; }}
-            QPushButton:pressed {{ background: #2a0000; }}
-        """)
-        self._interrupt_btn.clicked.connect(self._interrupt)
-        btn_row.addWidget(self._interrupt_btn)
-        
-        fs_btn = QPushButton("⛶ Full")
-        fs_btn.setFixedHeight(28)
-        fs_btn.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        fs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        fs_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 4px;
-            }}
-            QPushButton:hover {{
-                color: {C.PRI}; border: 1px solid {C.BORDER_B};
-            }}
-        """)
-        fs_btn.clicked.connect(self._toggle_fullscreen)
-        btn_row.addWidget(fs_btn)
-        
-        lay.addLayout(btn_row)
+        lay.addWidget(self._controls)
 
         return w
 
-    def _build_input_row(self) -> QHBoxLayout:
-        row = QHBoxLayout(); row.setSpacing(4)
-        self._input = QLineEdit()
-        self._input.setPlaceholderText("Type a command...")
-        self._input.setFont(QFont("Consolas", 9))
-        self._input.setFixedHeight(28)
-        self._input.setStyleSheet(f"""
-            QLineEdit {{
-                background: #000810; color: {C.WHITE};
-                border: 1px solid {C.BORDER}; border-radius: 0px; padding: 3px 7px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
-        """)
-        self._input.returnPressed.connect(self._send)
-        row.addWidget(self._input)
+    def _set_center_accent(self, color: str):
+        self._neural_header.set_accent(color)
+        self._comms_viewport.set_accent(color)
 
-        send = QPushButton("▸")
-        send.setFixedSize(28, 28)
-        send.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
-        send.setCursor(Qt.CursorShape.PointingHandCursor)
-        send.setStyleSheet(f"""
-            QPushButton {{
-                background: {C.PANEL}; color: {C.PRI};
-                border: 1px solid {C.PRI_DIM}; border-radius: 0px;
-            }}
-            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
-        """)
-        send.clicked.connect(self._send)
-        row.addWidget(send)
-        return row
+    def _set_right_accent(self, color: str):
+        self._right_rail.set_accent(color)
+        self._terminal_header.set_accent(C.ACC2 if color == C.PRI else color)
+        self._terminal_viewport.set_accent(C.ACC2 if color == C.PRI else color)
+        self._vault_tag.set_accent(C.ACC if color == C.PRI else color)
+        self._drop_zone.set_accent(C.ACC if color == C.PRI else color)
+        self._transmit.set_accent(C.GREEN if color == C.PRI else color)
+        self._controls.set_accent(color)
 
     def _build_footer(self) -> QWidget:
         w = QWidget()
@@ -1826,10 +2768,10 @@ class MainWindow(QMainWindow):
     def _on_file_selected(self, path: str):
         self._current_file = path
         p    = Path(path)
-        cat  = _file_category(p)
-        icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
         size = _fmt_size(p.stat().st_size)
-        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell JARVIS what to do with it")
+        self._vault_status.set_text(
+            f"PAYLOAD LOCKED · {p.name.upper()[:22]} · {size}", C.GREEN
+        )
         self._log.append_log(f"FILE: {p.name} ({size}) loaded")
         if self.on_text_command:
             msg = (
@@ -1852,24 +2794,7 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
-        if self._muted:
-            self._mute_btn.setText("🔇 Mic")
-            self._mute_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #140006; color: {C.MUTED_C};
-                    border: 1px solid {C.MUTED_C}; border-radius: 4px;
-                }}
-                QPushButton:hover {{ background: #1a0008; }}
-            """)
-        else:
-            self._mute_btn.setText("🎙 Mic")
-            self._mute_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background: #00140a; color: {C.GREEN};
-                    border: 1px solid {C.GREEN}; border-radius: 4px;
-                }}
-                QPushButton:hover {{ background: #001f10; }}
-            """)
+        self._controls.set_mute_active(self._muted)
 
     def _send(self):
         txt = self._input.text().strip()
@@ -1908,38 +2833,71 @@ class MainWindow(QMainWindow):
         player.play()
         print(f"[UI] Sound sequence: {file_name}")
 
-    def _apply_state(self, state: str):
-        # print(f"[UI] State Transition: {state}")
-        self.hud.state    = state
-        self.hud.speaking = (state == "SPEAKING")
-        
-        # Globally update UI accent if in Standby
-        if state == "STANDBY":
-            self.setStyleSheet(f"""
-                QMainWindow {{ background: {C.BG}; }}
-                QWidget#sidePanel {{ border-right: 1px solid {C.STANDBY_C}; }}
-                QLabel#panelTitle {{ color: {C.STANDBY_C}; }}
-            """)
-            self._log.setStyleSheet(f"border-left: 1px solid {C.STANDBY_C}; background: {C.PANEL};")
-            self._activity_log.setStyleSheet(f"QTextEdit {{ background: transparent; border: none; color: {C.STANDBY_C}; }}")
-            # Update all circular gauges and metric bars
+    def _lerp_color(self, a: str, b: str, t: float) -> str:
+        ca, cb = QColor(a), QColor(b)
+        return QColor(
+            int(ca.red()   + (cb.red()   - ca.red())   * t),
+            int(ca.green() + (cb.green() - ca.green()) * t),
+            int(ca.blue()  + (cb.blue()  - ca.blue())  * t),
+        ).name()
+
+    def _apply_accent_blend(self, blend: float):
+        accent = self._lerp_color(C.PRI, C.STANDBY_C, blend)
+        border = self._lerp_color(C.BORDER_B, C.STANDBY_C, blend)
+        self.setStyleSheet(f"""
+            QMainWindow {{ background: {C.BG}; }}
+            QWidget#sidePanel {{ border-right: 1px solid {border}; }}
+            QWidget#rightPanel {{ border-left: 1px solid {border}; }}
+            QLabel#panelTitle {{ color: {accent}; }}
+        """)
+        self._header.set_blend(blend)
+        self._header.set_accent(C.PRI)
+        self.hud.set_standby_blend(blend)
+        if blend > 0.5:
             for gauge in [self._gauge_cpu, self._gauge_mem, self._gauge_gpu, self._gauge_tmp]:
                 gauge.set_color(C.STANDBY_C)
             self._bar_net.set_color(C.STANDBY_C)
+            self._status_leds.set_colors([C.STANDBY_C, C.STANDBY_C, C.TEXT_DIM])
+            self._set_center_accent(C.STANDBY_C)
+            self._set_right_accent(C.STANDBY_C)
         else:
-            self.setStyleSheet(f"""
-                QMainWindow {{ background: {C.BG}; }}
-                QWidget#sidePanel {{ border-right: 1px solid {C.BORDER_B}; }}
-                QLabel#panelTitle {{ color: {C.PRI}; }}
-            """)
-            self._log.setStyleSheet(f"border-left: 1px solid {C.BORDER_B}; background: {C.PANEL};")
-            self._activity_log.setStyleSheet(f"QTextEdit {{ background: transparent; border: none; color: {C.PRI}; }}")
-            # Restore original colors
             self._gauge_cpu.set_color(C.PRI)
             self._gauge_mem.set_color(C.ACC2)
             self._gauge_gpu.set_color(C.ACC)
             self._gauge_tmp.set_color("#ff6688")
             self._bar_net.set_color(C.GREEN)
+            self._status_leds.set_colors([C.GREEN, C.PRI, C.TEXT_DIM])
+            self._set_center_accent(C.PRI)
+            self._set_right_accent(C.PRI)
+
+    def _apply_state(self, state: str):
+        self.hud.state = state
+        self.hud.speaking = (state == "SPEAKING")
+        self._pending_state = state
+
+        to_standby = state == "STANDBY"
+        from_standby = self._state_blend > 0.5 and not to_standby
+        if to_standby or from_standby or abs(self._state_target - (1.0 if to_standby else 0.0)) > 0.01:
+            self._state_target = 1.0 if to_standby else 0.0
+            self._transition_overlay.play(
+                to_standby,
+                on_tick=self._on_state_transition_tick,
+                on_done=self._finish_state_transition,
+            )
+        else:
+            self._apply_accent_blend(self._state_target)
+
+    def _on_state_transition_tick(self, progress: float, to_standby: bool):
+        if to_standby:
+            blend = progress
+        else:
+            blend = 1.0 - progress
+        self._state_blend = blend
+        self._apply_accent_blend(blend)
+
+    def _finish_state_transition(self):
+        self._state_blend = self._state_target
+        self._apply_accent_blend(self._state_blend)
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -1972,9 +2930,8 @@ class MainWindow(QMainWindow):
         if self._overlay:
             self._overlay.hide()
             self._overlay = None
-        self._apply_state("LISTENING")
-        # Route setup log to chat log instead of activity log
-        self._chat_sig.emit(f"SYS: Initialised. OS={os_name.upper()}. JARVIS online.")
+        self._chat_sig.emit(f"SYS: Configured. OS={os_name.upper()}.")
+        self._apply_state("THINKING")
 
 class _RootShim:
     def __init__(self, app: QApplication):
@@ -1992,6 +2949,8 @@ class JarvisUI:
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)
+        self._vision_start_cb = None
+        self._vision_end_cb = None
 
     @property
     def muted(self) -> bool:
@@ -2028,8 +2987,11 @@ class JarvisUI:
     def play_sound(self, file_name: str):
         self._win._play_sig.emit(file_name)
 
+    def play_startup_sequence(self):
+        self._win._startup_sig.emit()
+
     def play_startup_sound(self):
-        self.play_sound("startup.mp3")
+        self.play_startup_sequence()
 
     def write_log(self, text: str):
         if text.startswith("Jarvis:") or text.startswith("You:") or text.startswith("SYS: JARVIS"):
@@ -2037,9 +2999,26 @@ class JarvisUI:
         else:
             self._win._log_sig.emit(text)
 
+    def stream_chat(self, speaker: str, chunk: str):
+        self._win._chat_stream_sig.emit(speaker, chunk)
+
+    def finish_chat_stream(self, speaker: str):
+        self._win._chat_stream_end_sig.emit(speaker)
+
+    def vision_started(self):
+        if self._vision_start_cb:
+            self._vision_start_cb()
+
+    def vision_ended(self):
+        if self._vision_end_cb:
+            self._vision_end_cb()
+
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
+
+    def wait_for_startup_init(self):
+        self._win._startup_done_event.wait()
 
     def start_speaking(self):
         self.set_state("SPEAKING")

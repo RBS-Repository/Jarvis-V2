@@ -1,7 +1,12 @@
 #web_search.py
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -56,6 +61,86 @@ def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     return results
 
 
+_PH_NEWS_FEEDS = (
+    ("Rappler",   "https://www.rappler.com/feed/"),
+    ("Inquirer",  "https://newsinfo.inquirer.net/feed"),
+)
+
+_PH_NEWS_HINTS = (
+    "news", "headline", "headlines", "rappler", "inquirer",
+    "philippine", "ph news", "latest story", "what happened",
+    "briefing", "top story",
+)
+
+
+def _is_ph_news_query(query: str) -> bool:
+    q = query.lower()
+    return any(h in q for h in _PH_NEWS_HINTS)
+
+
+def _parse_rss_headlines(source: str, url: str, limit: int = 4) -> list[dict]:
+    items: list[dict] = []
+    try:
+        resp = requests.get(
+            url,
+            timeout=12,
+            headers={"User-Agent": "Jarvis-MarkXXXIX/1.0"},
+        )
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        for node in root.findall(".//item")[:limit]:
+            title = (node.findtext("title") or "").strip()
+            link  = (node.findtext("link") or "").strip()
+            pub   = (node.findtext("pubDate") or node.findtext("published") or "").strip()
+            if title:
+                items.append({"source": source, "title": title, "link": link, "pub": pub})
+    except Exception as e:
+        print(f"[WebSearch] ⚠️ RSS {source} failed: {e}")
+    return items
+
+
+def _fetch_ph_headlines() -> str:
+    """Latest headlines from Rappler and Inquirer RSS feeds."""
+    all_items: list[dict] = []
+    for source, url in _PH_NEWS_FEEDS:
+        all_items.extend(_parse_rss_headlines(source, url, limit=4))
+
+    if not all_items:
+        try:
+            return _gemini_search(
+                "List the latest top headlines today from rappler.com and inquirer.net only. "
+                "Return exactly 6 items: 3 from Rappler, 3 from Inquirer. "
+                "Format each as: [SOURCE] Headline — one-line summary."
+            )
+        except Exception as e:
+            print(f"[WebSearch] ⚠️ PH headline fallback failed: {e}")
+            results = _ddg_search(
+                "site:rappler.com OR site:inquirer.net Philippines news today headlines",
+                max_results=8,
+            )
+            return _format_ddg("Philippines headlines — Rappler & Inquirer", results)
+
+    lines = [
+        "PHILIPPINE HEADLINES — Rappler & Inquirer",
+        f"Fetched {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        "",
+    ]
+    for i, item in enumerate(all_items[:8], 1):
+        src = item.get("source", "News")
+        title = re.sub(r"\s+", " ", item.get("title", "")).strip()
+        pub = item.get("pub", "")
+        if pub:
+            lines.append(f"{i}. [{src}] {title}")
+            lines.append(f"   · {pub}")
+        else:
+            lines.append(f"{i}. [{src}] {title}")
+        link = item.get("link", "")
+        if link:
+            lines.append(f"   {link}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _format_ddg(query: str, results: list[dict]) -> str:
     if not results:
         return f"No results found for: {query}"
@@ -103,6 +188,8 @@ def web_search(
     params = parameters or {}
     query  = params.get("query", "").strip()
     mode   = params.get("mode",  "search").lower().strip()
+    if mode in ("ph_headlines", "ph_news", "headlines"):
+        mode = "ph_headlines"
     items  = params.get("items", [])
     aspect = params.get("aspect", "general").strip() or "general"
     save_as_docx = params.get("save_as_docx", False)
@@ -120,7 +207,11 @@ def web_search(
     print(f"[WebSearch] 🔍 Query: {query!r}  Mode: {mode}")
 
     try:
-        if mode == "compare" and items:
+        if mode == "ph_headlines" or _is_ph_news_query(query):
+            print("[WebSearch] 📰 Fetching Rappler + Inquirer headlines...")
+            result = _fetch_ph_headlines()
+            print("[WebSearch] ✅ PH headlines ready.")
+        elif mode == "compare" and items:
             print(f"[WebSearch] 📊 Comparing: {items}")
             result = _compare(items, aspect)
             print("[WebSearch] ✅ Compare done.")
