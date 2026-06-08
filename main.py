@@ -968,7 +968,8 @@ class JarvisLive:
                             if score > 0.15:
                                 print(f"[JARVIS] 🔔 Wake word triggered by '{m_name}' (Score: {score:.2f})")
                                 self.standby = False
-                                loop.call_soon_threadsafe(self.ui.play_startup_sequence)
+                                loop.call_soon_threadsafe(self.ui.set_state, "LISTENING")
+                                loop.call_soon_threadsafe(self.ui.play_sound, "startup.mp3")
                                 loop.call_soon_threadsafe(self.ui.write_log, "SYS: Wake word detected.")
                                 # SYNCHRONIZE WITH SERVER
                                 self.speak("Wake up, Jarvis.")
@@ -1198,8 +1199,8 @@ class JarvisLive:
                     self._turn_done_event = asyncio.Event()
 
                     print("[JARVIS] ✅ Connected.")
-                    self.ui.play_startup_sequence()
-                    await asyncio.to_thread(self.ui.wait_for_startup_init)
+                    self.ui.play_startup_sound()
+                    await asyncio.sleep(2.0)
 
                     self.ui.set_state("LISTENING")
 
@@ -1267,6 +1268,7 @@ def main():
 
     def runner():
         ui.wait_for_api_key()
+        ui.wait_for_boot()
         jarvis = JarvisLive(ui)
         ui.on_interrupt = jarvis._handle_interrupt
         ui._vision_start_cb = jarvis.begin_vision

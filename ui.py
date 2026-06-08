@@ -253,7 +253,7 @@ class HudCanvas(QWidget):
 
         self.muted    = False
         self.speaking = False
-        self.state    = "THINKING"
+        self.state    = "INITIALISING"
         self._standby_blend = 0.0
 
         self._tick       = 0
@@ -267,8 +267,8 @@ class HudCanvas(QWidget):
         self._scan3      = 90.0
 
         # Wake-up animation state
-        self._wake_up_progress = 1.0
-        self._wake_up_active = False
+        self._wake_up_progress = 0.0
+        self._wake_up_active = True
         self._wake_up_external = False
 
         # Audio visualizer state
@@ -319,23 +319,12 @@ class HudCanvas(QWidget):
         except Exception:
             self._face_px = None
 
-    def reset_for_startup_init(self):
-        """Reset arcs for startup sound sync sequence."""
-        self._wake_up_progress = 0.0
-        self._wake_up_active = True
-        self._wake_up_external = True
-        self._arc_offsets = [random.uniform(0, 360) for _ in self._arc_rings]
-        self._pulses = [0.0]
-        self.state = "INITIALISING"
-        self.update()
-
     def set_wake_up_progress(self, progress: float):
-        """Drive arc init animation (synced to startup sound)."""
+        """Set wake-up progress from MainWindow / boot overlay to sync animations."""
         self._wake_up_external = True
         self._wake_up_progress = max(0.0, min(1.0, progress))
         if self._wake_up_progress >= 1.0:
             self._wake_up_active = False
-            self._wake_up_external = False
 
     def set_standby_blend(self, blend: float):
         self._standby_blend = max(0.0, min(1.0, blend))
@@ -410,18 +399,8 @@ class HudCanvas(QWidget):
         # Rotate orbital arc rings (degrees/sec, frame-rate independent)
         speak_mult = 2.0 if self.speaking else 1.0
         sleep_mult = 0.35 if is_sleeping else 1.0
-        init_mult = (0.12 + 0.88 * self._wake_up_progress) if self._wake_up_active else 1.0
         for i, (_, rot_spd, _, _) in enumerate(self._arc_rings):
-            self._arc_offsets[i] = (
-                self._arc_offsets[i] + rot_spd * speak_mult * sleep_mult * init_mult * dt
-            ) % 360
-
-        if self._wake_up_active and self._wake_up_progress < 1.0:
-            fw_i = min(self.width(), self.height())
-            if random.random() < 0.12:
-                self._pulses.append(0.0)
-            lim_i = fw_i * 0.74 * self._wake_up_progress
-            self._pulses = [r + 3.5 for r in self._pulses if r + 3.5 < lim_i]
+            self._arc_offsets[i] = (self._arc_offsets[i] + rot_spd * speak_mult * sleep_mult * dt) % 360
 
         scan_rate = 220.0 if self.speaking else 72.0
         self._scan  = (self._scan  + scan_rate * dt) % 360
@@ -512,13 +491,7 @@ class HudCanvas(QWidget):
                 glow_a = int(glow_a * ring_progress)
                 core_a = int(core_a * ring_progress)
 
-            if self._wake_up_active and ring_progress < 1.0:
-                vis_segs = max(1, int(n_seg * ring_progress))
-                ring_path = _arc_ring_path(
-                    cx, cy, radius, offset, n_seg, draw_deg, seg_deg, max_seg=vis_segs,
-                )
-            else:
-                ring_path = _arc_ring_path(cx, cy, radius, offset, n_seg, draw_deg, seg_deg)
+            ring_path = _arc_ring_path(cx, cy, radius, offset, n_seg, draw_deg, seg_deg)
 
             glow_col = QColor(main_clr)
             glow_col.setAlpha(glow_a)
@@ -678,22 +651,6 @@ class HudCanvas(QWidget):
         elif self.state == "LISTENING":
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  LISTENING",  self._cur_clr
-        elif self.state == "INITIALISING" or self._wake_up_active:
-            phases = (
-                (0.22, "◈  ARC SYNC · RING 01"),
-                (0.45, "◈  ARC SYNC · RING 02"),
-                (0.68, "◈  ARC SYNC · RING 03"),
-                (0.88, "◈  ARC SYNC · RING 04"),
-                (1.00, "◈  SYNCHRONISED"),
-            )
-            txt = phases[-1][1]
-            for thresh, label in phases:
-                if self._wake_up_progress <= thresh:
-                    txt = label
-                    break
-            sym = "◇" if self._blink else "◈"
-            txt = f"{sym}  {txt}"
-            col = self._cur_clr
         else:
             sym = "●" if self._blink else "○"
             txt, col = f"{sym}  {self.state}", self._cur_clr
@@ -719,13 +676,11 @@ class HudCanvas(QWidget):
 def _arc_ring_path(
     cx: float, cy: float, radius: float,
     offset_deg: float, n_seg: int, draw_deg: float, seg_deg: float,
-    max_seg: int | None = None,
 ) -> QPainterPath:
     """Single path for all arc segments on one ring — one draw call instead of dozens."""
     path = QPainterPath()
     rect = QRectF(cx - radius, cy - radius, radius * 2, radius * 2)
-    count = n_seg if max_seg is None else min(n_seg, max(0, max_seg))
-    for s in range(count):
+    for s in range(n_seg):
         start = offset_deg + s * seg_deg
         seg = QPainterPath()
         seg.arcMoveTo(rect, start)
@@ -1240,6 +1195,170 @@ class OrbitalCommandStrip(QWidget):
         sweep = (self._phase * 50) % W
         p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 35), 1))
         p.drawLine(QPointF(sweep, 0), QPointF(sweep - 40, H))
+
+
+class BootSequenceOverlay(QWidget):
+    """Full startup initialization sequence on first boot."""
+
+    finished = pyqtSignal()
+
+    _PHASES = (
+        (0.18, "POWERING CORE SYSTEMS"),
+        (0.38, "LOADING NEURAL MATRIX"),
+        (0.58, "CALIBRATING SENSORS"),
+        (0.78, "ESTABLISHING UPLINK"),
+        (1.00, "MARK XXXIX — ONLINE"),
+    )
+
+    def __init__(self, hud: HudCanvas, parent=None):
+        super().__init__(parent)
+        self._hud = hud
+        self._progress = 0.0
+        self._fade = 1.0
+        self._phase = 0.0
+        self._hex_rot = 0.0
+        self._scan_y = 0.0
+        self._log_lines: list[str] = []
+        self._running = False
+        self._fading = False
+        self._tmr = QTimer(self)
+        self._tmr.timeout.connect(self._step)
+        self.hide()
+
+    def start(self):
+        self._progress = 0.0
+        self._fade = 1.0
+        self._fading = False
+        self._running = True
+        self._log_lines = []
+        self._hud.state = "INITIALISING"
+        self._hud._wake_up_active = True
+        self._hud._wake_up_external = True
+        self._hud.set_wake_up_progress(0.0)
+        self.setGeometry(self.parent().rect())
+        self.show()
+        self.raise_()
+        self._tmr.start(18)
+
+    def _current_phase_text(self) -> str:
+        for threshold, label in self._PHASES:
+            if self._progress <= threshold:
+                return label
+        return self._PHASES[-1][1]
+
+    def _step(self):
+        if self._fading:
+            self._fade = max(0.0, self._fade - 0.07)
+            self.update()
+            if self._fade <= 0.0:
+                self._tmr.stop()
+                self._running = False
+                self._fading = False
+                self.hide()
+                self.finished.emit()
+            return
+
+        self._progress = min(1.0, self._progress + 0.009)
+        self._phase = (self._phase + 0.1) % (2 * math.pi)
+        self._hex_rot = (self._hex_rot + 1.4) % 360
+        self._scan_y = (self._scan_y + 2.5) % max(self.height(), 1)
+        self._hud.set_wake_up_progress(self._progress)
+
+        phase = self._current_phase_text()
+        if not self._log_lines or not self._log_lines[-1].endswith(phase):
+            self._log_lines.append(f"[{int(self._progress * 100):03d}%] {phase}")
+            if len(self._log_lines) > 6:
+                self._log_lines.pop(0)
+
+        self.update()
+
+        if self._progress >= 1.0:
+            self._fading = True
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        W, H = self.width(), self.height()
+        opacity = self._fade
+
+        p.fillRect(self.rect(), qcol("#000408", int(240 * opacity)))
+
+        p.setPen(QPen(qcol(C.BORDER, int(40 * opacity)), 1))
+        for gx in range(0, W, 28):
+            p.drawLine(QPointF(gx, 0), QPointF(gx, H))
+        for gy in range(0, H, 28):
+            p.drawLine(QPointF(0, gy), QPointF(W, gy))
+
+        scan_a = int(50 * opacity)
+        p.setPen(QPen(qcol(C.PRI, scan_a), 1))
+        p.drawLine(QPointF(0, self._scan_y), QPointF(W, self._scan_y))
+
+        cx, cy = W / 2, H * 0.42
+        pulse = 0.5 + 0.5 * math.sin(self._phase)
+
+        for i, rad_f in enumerate((0.22, 0.32, 0.42, 0.52)):
+            r = min(W, H) * rad_f * (0.35 + 0.65 * self._progress)
+            ring = _hex_path(cx, cy, r, self._hex_rot + i * 22)
+            a = int((60 + i * 25) * pulse * opacity)
+            p.setPen(QPen(qcol(C.PRI, a), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(ring)
+
+        p.setBrush(QBrush(qcol(C.PRI, int(30 * opacity))))
+        p.setPen(QPen(qcol(C.PRI, int(180 * opacity)), 2))
+        core_r = min(W, H) * 0.08 * (0.4 + 0.6 * self._progress)
+        p.drawPath(_hex_path(cx, cy, core_r, -self._hex_rot * 1.5))
+
+        p.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.PRI, int(255 * opacity)), 1))
+        title = "SYSTEM INITIALISATION"
+        tw = p.fontMetrics().horizontalAdvance(title)
+        p.drawText(QRectF(cx - tw / 2, cy - min(W, H) * 0.34, tw, 20),
+                   Qt.AlignmentFlag.AlignCenter, title)
+
+        phase = self._current_phase_text()
+        p.setFont(QFont("Consolas", 8))
+        p.setPen(QPen(qcol(C.TEXT_MED, int(220 * opacity)), 1))
+        pw = p.fontMetrics().horizontalAdvance(phase)
+        p.drawText(QRectF(cx - pw / 2, cy + min(W, H) * 0.30, pw, 18),
+                   Qt.AlignmentFlag.AlignCenter, phase)
+
+        bar_w = min(420, W - 80)
+        bar_x = cx - bar_w / 2
+        bar_y = cy + min(W, H) * 0.38
+        bar_h = 8
+        p.setBrush(QBrush(qcol("#001018", int(200 * opacity))))
+        p.setPen(QPen(qcol(C.BORDER, int(100 * opacity)), 1))
+        p.drawPath(_chamfer_rect(bar_x, bar_y, bar_w, bar_h, 3))
+
+        fill_w = bar_w * self._progress
+        if fill_w > 2:
+            fill_grad = QLinearGradient(bar_x, 0, bar_x + fill_w, 0)
+            fill_grad.setColorAt(0.0, qcol(C.PRI_DIM, int(200 * opacity)))
+            fill_grad.setColorAt(1.0, qcol(C.PRI, int(255 * opacity)))
+            p.setBrush(QBrush(fill_grad))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawPath(_chamfer_rect(bar_x, bar_y, fill_w, bar_h, 3))
+
+        pct = f"{int(self._progress * 100)}%"
+        p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+        p.setPen(QPen(qcol(C.PRI, int(200 * opacity)), 1))
+        p.drawText(QRectF(bar_x, bar_y + 14, bar_w, 14),
+                   Qt.AlignmentFlag.AlignCenter, pct)
+
+        p.setFont(QFont("Consolas", 6))
+        p.setPen(QPen(qcol(C.TEXT_DIM, int(180 * opacity)), 1))
+        ly = H * 0.72
+        for i, line in enumerate(self._log_lines[-5:]):
+            p.drawText(QRectF(40, ly + i * 14, W - 80, 14),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, line)
+
+        p.setPen(QPen(qcol(C.BORDER_B, int(90 * opacity)), 1))
+        for sx, sy in [(-1, -1), (1, -1), (-1, 1), (1, 1)]:
+            ox = 16 if sx < 0 else W - 28
+            oy = 16 if sy < 0 else H - 28
+            p.drawLine(QPointF(ox, oy), QPointF(ox + 14 * sx, oy))
+            p.drawLine(QPointF(ox, oy), QPointF(ox, oy + 14 * sy))
 
 
 class StateTransitionOverlay(QWidget):
@@ -2385,9 +2504,8 @@ class MainWindow(QMainWindow):
     _chat_sig  = pyqtSignal(str)   # Communications Log
     _chat_stream_sig     = pyqtSignal(str, str)
     _chat_stream_end_sig = pyqtSignal(str)
-    _state_sig    = pyqtSignal(str)
-    _play_sig     = pyqtSignal(str)
-    _startup_sig  = pyqtSignal()
+    _state_sig = pyqtSignal(str)
+    _play_sig  = pyqtSignal(str)
 
 
     def __init__(self, face_path: str):
@@ -2464,7 +2582,6 @@ class MainWindow(QMainWindow):
         self._set_center_accent(C.PRI)
         self._state_sig.connect(self._apply_state)
         self._play_sig.connect(self._on_play_requested)
-        self._startup_sig.connect(self.start_startup_sequence)
 
         self._overlay: SetupOverlay | None = None
 
@@ -2480,86 +2597,38 @@ class MainWindow(QMainWindow):
         self._state_blend = 0.0
         self._state_target = 0.0
         self._pending_state = "LISTENING"
-        self._startup_init_running = False
-        self._startup_init_done = True
-        self._startup_done_event = threading.Event()
-        self._startup_done_event.set()
-        self._startup_duration_ms = 0
+        self._boot_complete = False
+        self._boot_running = False
         self._transition_overlay = StateTransitionOverlay(central)
         self._transition_overlay.setGeometry(central.rect())
+        self._boot_overlay = BootSequenceOverlay(self.hud, central)
+        self._boot_overlay.setGeometry(central.rect())
+        self._boot_overlay.finished.connect(self._on_boot_finished)
         central.installEventFilter(self)
+
+        if self._ready:
+            QTimer.singleShot(250, self._start_boot_sequence)
 
     def eventFilter(self, obj, event):
         if obj is self.centralWidget() and event.type() == QEvent.Type.Resize:
             rect = self.centralWidget().rect()
             self._transition_overlay.setGeometry(rect)
+            self._boot_overlay.setGeometry(rect)
         return super().eventFilter(obj, event)
 
-    def start_startup_sequence(self):
-        """Animate HUD arcs in sync with startup.mp3."""
-        if self._startup_init_running:
+    def _start_boot_sequence(self):
+        if self._boot_running or self._boot_complete:
             return
-        self._startup_init_running = True
-        self._startup_init_done = False
-        self._startup_done_event.clear()
-        self._startup_duration_ms = 0
-        self.hud.reset_for_startup_init()
+        self._boot_running = True
         self._apply_state("INITIALISING")
+        self._boot_overlay.start()
 
-        path = BASE_DIR / "assets" / "startup.mp3"
-        if not path.exists():
-            print(f"[UI] Startup sound not found: {path}")
-            self._finish_startup_init()
-            return
-
-        player = QMediaPlayer(self)
-        audio = QAudioOutput(self)
-        player.setAudioOutput(audio)
-        player.setSource(QUrl.fromLocalFile(str(path)))
-        audio.setVolume(0.9)
-        self._startup_player = player
-        self._startup_audio = audio
-        self._startup_init_start = time.perf_counter()
-
-        player.durationChanged.connect(self._on_startup_duration)
-        player.mediaStatusChanged.connect(self._on_startup_media_status)
-        player.errorOccurred.connect(lambda *_: self._finish_startup_init())
-
-        if not hasattr(self, "_startup_init_tmr"):
-            self._startup_init_tmr = QTimer(self)
-            self._startup_init_tmr.timeout.connect(self._tick_startup_init)
-        self._startup_init_tmr.start(16)
-        player.play()
-        print("[UI] Startup sequence: arcs synced to startup.mp3")
-
-    def _on_startup_duration(self, duration_ms: int):
-        if duration_ms > 0:
-            self._startup_duration_ms = duration_ms
-
-    def _on_startup_media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self._finish_startup_init()
-
-    def _tick_startup_init(self):
-        player = getattr(self, "_startup_player", None)
-        if player and self._startup_duration_ms > 0:
-            progress = min(1.0, player.position() / max(1, self._startup_duration_ms))
-        else:
-            progress = min(1.0, (time.perf_counter() - self._startup_init_start) / 2.8)
-        self.hud.set_wake_up_progress(progress)
-        if progress >= 0.995:
-            self._finish_startup_init()
-
-    def _finish_startup_init(self):
-        if self._startup_init_done:
-            return
-        self._startup_init_done = True
-        self._startup_init_running = False
-        if hasattr(self, "_startup_init_tmr"):
-            self._startup_init_tmr.stop()
+    def _on_boot_finished(self):
+        self._boot_running = False
+        self._boot_complete = True
         self.hud.set_wake_up_progress(1.0)
-        self._startup_done_event.set()
-        print("[UI] Startup sequence complete.")
+        self._log_sig.emit("SYS: Boot sequence complete.")
+        self._apply_state("LISTENING")
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -2931,7 +3000,7 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._chat_sig.emit(f"SYS: Configured. OS={os_name.upper()}.")
-        self._apply_state("THINKING")
+        QTimer.singleShot(200, self._start_boot_sequence)
 
 class _RootShim:
     def __init__(self, app: QApplication):
@@ -2987,11 +3056,8 @@ class JarvisUI:
     def play_sound(self, file_name: str):
         self._win._play_sig.emit(file_name)
 
-    def play_startup_sequence(self):
-        self._win._startup_sig.emit()
-
     def play_startup_sound(self):
-        self.play_startup_sequence()
+        self.play_sound("startup.mp3")
 
     def write_log(self, text: str):
         if text.startswith("Jarvis:") or text.startswith("You:") or text.startswith("SYS: JARVIS"):
@@ -3017,8 +3083,9 @@ class JarvisUI:
         while not self._win._ready:
             time.sleep(0.1)
 
-    def wait_for_startup_init(self):
-        self._win._startup_done_event.wait()
+    def wait_for_boot(self):
+        while not self._win._boot_complete:
+            time.sleep(0.05)
 
     def start_speaking(self):
         self.set_state("SPEAKING")
